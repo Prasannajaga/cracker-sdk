@@ -1,0 +1,118 @@
+Implement only the boilerplate for a new local Python package named `cracker-sdk`.
+
+Goal:
+Create a clean minimal Firecracker SDK package that SparkVM can later depend on. Do not integrate it into SparkVM yet. Only add the package skeleton and basic implementation.
+
+Package rules:
+
+* Distribution/package name in `pyproject.toml`: `cracker-sdk`
+* Python import module should be: `crackerSDK`
+* Public usage should support:
+
+```python
+from crackerSDK import crackerVM
+
+vm = crackerVM(
+    binary="/home/user/.sparkvm/bin/firecracker",
+    socket_path="/tmp/fc.sock",
+    log_path="/tmp/firecracker.log",
+)
+
+vm.start()
+vm.wait_until_ready()
+
+vm.machine(vcpu_count=2, mem_size_mib=2048)
+vm.boot_source(kernel_image_path="vmlinux", boot_args="...")
+vm.root_drive(path="rootfs.ext4")
+vm.drive(drive_id="data", path="execution.ext4")
+vm.network(iface_id="eth0", host_dev_name="tap0", guest_mac="AA:FC:00:00:00:01")
+vm.entropy()
+vm.boot()
+
+exit_code = vm.wait(timeout=60)
+```
+
+Create this structure:
+
+```txt
+    pyproject.toml
+    README.md
+    src/
+      crackerSDK/
+        __init__.py
+        vm.py
+```
+
+Implementation requirements:
+
+* Keep the SDK implementation mostly inside `vm.py` for now.
+* Organize `vm.py` with clear sections:
+
+  1. Errors
+  2. Unix socket HTTP client
+  3. Firecracker process management
+  4. Boot path APIs
+  5. Runtime control APIs
+  6. Networking APIs
+  7. Snapshotting APIs
+  8. High-level `crackerVM` facade
+* Use only Python standard library.
+* Do not import anything from `sparkvm`.
+* Add typed dataclasses where useful, but keep it minimal.
+* Add clean error classes:
+
+  * `FirecrackerError`
+  * `FirecrackerAPIError`
+  * `FirecrackerProcessError`
+  * `FirecrackerTimeoutError`
+* Implement low-level Unix socket HTTP request support:
+
+  * `GET`
+  * `PUT`
+  * `PATCH`
+* Implement these boot path APIs:
+
+  * `GET /machine-config`
+  * `PUT /machine-config`
+  * `PUT /boot-source`
+  * `PUT /drives/{drive_id}`
+  * `PATCH /drives/{drive_id}`
+  * `PUT /actions` with `InstanceStart`
+* Implement these runtime control methods:
+
+  * `pause()`
+  * `resume()`
+  * `send_ctrl_alt_del()`
+* Implement networking:
+
+  * `network(iface_id, host_dev_name, guest_mac)`
+  * internally call `PUT /network-interfaces/{iface_id}`
+* Implement entropy:
+
+  * `entropy()`
+  * internally call `PUT /entropy` with `{}`.
+* Implement snapshotting boilerplate:
+
+  * `create_snapshot(snapshot_path, mem_file_path)`
+  * `load_snapshot(snapshot_path, mem_file_path, resume=False)`
+* Snapshot methods can be thin wrappers around Firecracker API payloads. Keep them simple.
+* `crackerVM.start()` should start the Firecracker process:
+
+  * command: `[binary, "--api-sock", socket_path]`
+  * if `namespace_name` is provided, command should be:
+    `[ "ip", "netns", "exec", namespace_name, binary, "--api-sock", socket_path ]`
+* `wait_until_ready()` should wait until the socket file exists and `/machine-config` responds.
+* `boot()` should call `PUT /actions` with `{"action_type": "InstanceStart"}`.
+* `wait(timeout)` should wait for the Firecracker process and return its exit code.
+* `stop()` should terminate the process gracefully, then kill if needed.
+* `__enter__` / `__exit__` should be supported for context-manager usage.
+
+Important:
+
+* This is only the SDK boilerplate.
+* Do not modify existing SparkVM runtime logic.
+* Do not move existing files yet.
+* Do not add large abstractions.
+* Keep the code small, readable, and easy to extend later.
+* Add a short README showing the same usage example above.
+* Ensure `python -m compileall packages/cracker-sdk/src` passes.
