@@ -43,5 +43,9 @@ wget-log
 wget-log.1
 NEWREADME.md
 
-examples/
+examples/rootfs/**/mnt/
+examples/rootfs/**/rootfs.ext4
+examples/rootfs/**/rootfs.tar
+examples/rootfs/hello/init
 rootfs.ext4
+examples/

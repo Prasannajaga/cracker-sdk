@@ -1,16 +1,29 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import time
+from pathlib import Path
 from typing import Any
 
 from .boot import BootAPI
-from .errors import FirecrackerError, FirecrackerProcessError, FirecrackerTimeoutError
+from .errors import (
+    FirecrackerError,
+    FirecrackerProcessError,
+    FirecrackerStateError,
+    FirecrackerTimeoutError,
+)
+from .lifecycle import VMState, VMStatus
+from .logger import _LoggerAPI
 from .networking import NetworkingAPI
 from .process import ProcessConfig, ProcessManager
+from .result import VMRunResult
 from .runtime import RuntimeAPI
 from .snapshot import SnapshotAPI
 from .transport import UnixSocketHTTPClient
+
+
+DEFAULT_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
 
 
 class crackerVM:
@@ -20,13 +33,25 @@ class crackerVM:
         binary: str,
         socket_path: str,
         log_path: str | None = None,
+        workdir: str | None = None,
         namespace_name: str | None = None,
+        kernel_path: str | None = None,
+        rootfs_path: str | None = None,
+        boot_args: str = DEFAULT_BOOT_ARGS,
         api_timeout: float = 2.0,
     ):
         self.binary = binary
         self.socket_path = socket_path
+        self.workdir = workdir
+        if workdir is not None:
+            os.makedirs(workdir, exist_ok=True)
+            if log_path is None:
+                log_path = os.path.join(workdir, "firecracker.log")
         self.log_path = log_path
         self.namespace_name = namespace_name
+        self.kernel_path = kernel_path
+        self.rootfs_path = rootfs_path
+        self.boot_args = boot_args
 
         self._client = UnixSocketHTTPClient(socket_path=socket_path, timeout=api_timeout)
         self._proc = ProcessManager(
@@ -41,6 +66,9 @@ class crackerVM:
         self._runtime = RuntimeAPI(self._client)
         self._net = NetworkingAPI(self._client)
         self._snap = SnapshotAPI(self._client)
+        self._logger = _LoggerAPI(self._client)
+        self._state = VMState.EXITED
+        self._last_error: str | None = None
 
     def __enter__(self) -> crackerVM:
         self.start()
@@ -50,32 +78,96 @@ class crackerVM:
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self.stop()
 
+    @property
+    def state(self) -> VMState:
+        self._sync_state_from_process()
+        return self._state
+
     def start(self) -> None:
-        self._proc.start()
+        try:
+            self._proc.start()
+            self._last_error = None
+        except Exception as exc:
+            self._last_error = str(exc)
+            raise
 
     def wait_until_ready(self, timeout: float = 10.0, poll_interval: float = 0.1) -> None:
+        timeout = float(timeout)
         deadline = time.monotonic() + timeout
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             if self._proc.process and self._proc.process.poll() is not None:
-                raise FirecrackerProcessError("Firecracker exited before becoming ready")
+                error = FirecrackerProcessError("Firecracker exited before becoming ready")
+                self._state = VMState.EXITED
+                self._last_error = str(error)
+                raise error
 
             if os.path.exists(self.socket_path):
                 try:
                     self._boot.get_machine_config()
+                    self._last_error = None
                     return
                 except FirecrackerError as exc:
                     last_error = exc
             time.sleep(poll_interval)
 
         detail = f": {last_error}" if last_error else ""
-        raise FirecrackerTimeoutError(f"Timed out waiting for Firecracker API readiness{detail}")
+        error = FirecrackerTimeoutError(f"Timed out waiting for Firecracker API readiness{detail}")
+        self._last_error = str(error)
+        raise error
 
     def wait(self, timeout: float | None = None) -> int:
-        return self._proc.wait(timeout=timeout)
+        try:
+            exit_code = self._proc.wait(timeout=timeout)
+            self._state = VMState.EXITED
+            self._last_error = None
+            return exit_code
+        except Exception as exc:
+            self._last_error = str(exc)
+            raise
 
     def stop(self, timeout: float = 5.0) -> None:
-        self._proc.stop(timeout=timeout)
+        try:
+            self._proc.stop(timeout=timeout)
+            self._state = VMState.EXITED
+            self._last_error = None
+        except Exception as exc:
+            self._last_error = str(exc)
+            raise
+
+    def is_running(self) -> bool:
+        self._sync_state_from_process()
+        return self._state == VMState.RUNNING
+
+    def is_paused(self) -> bool:
+        self._sync_state_from_process()
+        return self._state == VMState.PAUSED
+
+    def is_stopped(self) -> bool:
+        self._sync_state_from_process()
+        return self._state == VMState.EXITED
+
+    def status(self) -> VMStatus:
+        process_running, pid, exit_code = self._process_state()
+        api_available = False
+
+        if process_running:
+            try:
+                self._boot.get_machine_config()
+                api_available = True
+            except Exception as exc:
+                self._last_error = str(exc)
+        else:
+            self._state = VMState.EXITED
+
+        return VMStatus(
+            state=self._state,
+            process_running=process_running,
+            api_available=api_available,
+            pid=pid,
+            exit_code=exit_code,
+            last_error=self._last_error,
+        )
 
     def machine(self, *, vcpu_count: int, mem_size_mib: int, smt: bool | None = None) -> None:
         self._boot.machine(vcpu_count=vcpu_count, mem_size_mib=mem_size_mib, smt=smt)
@@ -106,13 +198,96 @@ class crackerVM:
         self._boot.patch_drive(drive_id=drive_id, path=path)
 
     def boot(self) -> None:
-        self._boot.boot()
+        try:
+            self._boot.boot()
+            self._state = VMState.RUNNING
+            self._last_error = None
+        except Exception as exc:
+            self._last_error = str(exc)
+            raise
 
-    def pause(self) -> None:
-        self._runtime.pause()
+    def configure_logger(self, log_path: str, level: str = "Info") -> None:
+        self._logger.configure_logger(log_path=log_path, level=level)
 
-    def resume(self) -> None:
-        self._runtime.resume()
+    def run(
+        self,
+        *,
+        vcpu_count: int = 1,
+        mem_size_mib: int = 256,
+        timeout: float = 30.0,
+    ) -> VMRunResult:
+        error: str | None = None
+        exit_code: int | None = None
+        timed_out = False
+        timeout = float(timeout)
+
+        try:
+            self._ensure_log_path()
+            self._prepare_log_file()
+            self._proc.set_log_path(self.log_path)
+            self._proc.set_mirror_output_to_log(False)
+
+            if self.kernel_path is None:
+                raise FirecrackerError("kernel_path is required")
+            if self.rootfs_path is None:
+                raise FirecrackerError("rootfs_path is required")
+
+            self.start()
+            self.wait_until_ready(timeout=30)
+            self.configure_logger(log_path=str(Path(self.log_path).resolve()))
+            self.machine(vcpu_count=vcpu_count, mem_size_mib=mem_size_mib)
+            self.boot_source(kernel_image_path=self.kernel_path, boot_args=self.boot_args)
+            self.root_drive(path=self.rootfs_path)
+            self.boot()
+            exit_code = self.wait(timeout=timeout)
+        except FirecrackerTimeoutError as exc:
+            timed_out = True
+            error = str(exc)
+            self.stop()
+        except Exception as exc:
+            error = str(exc)
+            self.stop()
+
+        if error is not None:
+            self._last_error = error
+
+        return self._result(exit_code=exit_code, timed_out=timed_out, error=error)
+
+    def pause(self, *, strict: bool = False) -> VMStatus:
+        status = self.status()
+        if status.state == VMState.PAUSED and not strict:
+            return status
+        if status.state != VMState.RUNNING:
+            if strict:
+                self._raise_state_error("pause", status)
+            return status
+
+        try:
+            self._runtime.pause()
+            self._state = VMState.PAUSED
+            self._last_error = None
+            return self.status()
+        except Exception as exc:
+            self._last_error = str(exc)
+            raise
+
+    def resume(self, *, strict: bool = False) -> VMStatus:
+        status = self.status()
+        if status.state == VMState.RUNNING and not strict:
+            return status
+        if status.state != VMState.PAUSED:
+            if strict:
+                self._raise_state_error("resume", status)
+            return status
+
+        try:
+            self._runtime.resume()
+            self._state = VMState.RUNNING
+            self._last_error = None
+            return self.status()
+        except Exception as exc:
+            self._last_error = str(exc)
+            raise
 
     def send_ctrl_alt_del(self) -> None:
         self._runtime.send_ctrl_alt_del()
@@ -131,4 +306,86 @@ class crackerVM:
             snapshot_path=snapshot_path,
             mem_file_path=mem_file_path,
             resume=resume,
+        )
+
+    def _ensure_log_path(self) -> None:
+        if self.log_path is not None:
+            return
+
+        if self.workdir is None:
+            self.workdir = tempfile.mkdtemp(prefix="cracker-sdk-")
+        os.makedirs(self.workdir, exist_ok=True)
+        self.log_path = os.path.join(self.workdir, "firecracker.log")
+
+    def _prepare_log_file(self) -> None:
+        if self.log_path is None:
+            return
+
+        log_path = Path(self.log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("", encoding="utf-8")
+
+    def _process_state(self) -> tuple[bool, int | None, int | None]:
+        process = self._proc.process
+        if process is None:
+            return False, None, None
+
+        exit_code = process.poll()
+        if exit_code is None:
+            return True, process.pid, None
+
+        self._state = VMState.EXITED
+        return False, process.pid, exit_code
+
+    def _sync_state_from_process(self) -> None:
+        self._process_state()
+
+    def _raise_state_error(self, action: str, status: VMStatus) -> None:
+        error = FirecrackerStateError(
+            f"Cannot {action} VM while state is {status.state.value}"
+        )
+        self._last_error = str(error)
+        raise error
+
+    def _result(self, *, exit_code: int | None, timed_out: bool, error: str | None) -> VMRunResult:
+        stdout, stdout_firecracker_log = self._split_process_output(self._proc.stdout)
+        stderr, stderr_firecracker_log = self._split_process_output(self._proc.stderr)
+        firecracker_log = (
+            stdout_firecracker_log + stderr_firecracker_log + self._read_firecracker_log()
+        )
+
+        return VMRunResult(
+            exit_code=exit_code,
+            timed_out=timed_out,
+            firecracker_log=firecracker_log,
+            stdout=stdout,
+            stderr=stderr,
+            error=error,
+        )
+
+    def _read_firecracker_log(self) -> str:
+        if self.log_path is None:
+            return ""
+        try:
+            return Path(self.log_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _split_process_output(self, output: str) -> tuple[str, str]:
+        user_output: list[str] = []
+        firecracker_log: list[str] = []
+        for line in output.splitlines(keepends=True):
+            if self._looks_like_firecracker_log(line):
+                firecracker_log.append(line)
+            else:
+                user_output.append(line)
+        return "".join(user_output), "".join(firecracker_log)
+
+    def _looks_like_firecracker_log(self, line: str) -> bool:
+        return (
+            len(line) > 30
+            and line[4:5] == "-"
+            and line[7:8] == "-"
+            and "T" in line[:32]
+            and "[anonymous-instance:" in line
         )

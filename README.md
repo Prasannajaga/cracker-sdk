@@ -2,6 +2,18 @@
 
 Minimal local Firecracker SDK boilerplate package.
 
+Create a minimal bootable root filesystem:
+
+```bash
+./bin.sh rootfs.ext4
+```
+
+Use kernel args that point PID 1 at the generated `/init`:
+
+```text
+console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init
+```
+
 ```python
 from crackerSDK import crackerVM
 
@@ -15,7 +27,10 @@ vm.start()
 vm.wait_until_ready()
 
 vm.machine(vcpu_count=2, mem_size_mib=2048)
-vm.boot_source(kernel_image_path="vmlinux", boot_args="...")
+vm.boot_source(
+    kernel_image_path="vmlinux",
+    boot_args="console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init",
+)
 vm.root_drive(path="rootfs.ext4")
 vm.drive(drive_id="data", path="execution.ext4")
 vm.network(iface_id="eth0", host_dev_name="tap0", guest_mac="AA:FC:00:00:00:01")

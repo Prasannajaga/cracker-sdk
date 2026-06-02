@@ -12,3 +12,7 @@ class FirecrackerProcessError(FirecrackerError):
 
 class FirecrackerTimeoutError(FirecrackerError):
     pass
+
+
+class FirecrackerStateError(FirecrackerError):
+    pass
