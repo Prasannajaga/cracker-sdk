@@ -18,7 +18,13 @@ from .lifecycle import VMState, VMStatus
 from .logger import _LoggerAPI
 from .networking import NetworkingAPI
 from .process import ProcessConfig, ProcessManager
-from .result import RestoreResult, SnapshotResult, VMRunResult
+from .result import (
+    EntropyResult,
+    NetworkInterfaceResult,
+    RestoreResult,
+    SnapshotResult,
+    VMRunResult,
+)
 from .runtime import RuntimeAPI
 from .snapshot import SnapshotAPI
 from .transport import UnixSocketHTTPClient
@@ -70,6 +76,8 @@ class crackerVM:
         self._logger = _LoggerAPI(self._client)
         self._state = VMState.EXITED
         self._last_error: str | None = None
+        self._network_interfaces: dict[str, NetworkInterfaceResult] = {}
+        self._entropy_enabled = False
 
     def __enter__(self) -> crackerVM:
         self.start()
@@ -216,6 +224,8 @@ class crackerVM:
         vcpu_count: int = 1,
         mem_size_mib: int = 256,
         timeout: float = 30.0,
+        entropy: bool = False,
+        network_interfaces: list[dict[str, str]] | None = None,
     ) -> VMRunResult:
         error: str | None = None
         exit_code: int | None = None
@@ -239,6 +249,17 @@ class crackerVM:
             self.machine(vcpu_count=vcpu_count, mem_size_mib=mem_size_mib)
             self.boot_source(kernel_image_path=self.kernel_path, boot_args=self.boot_args)
             self.root_drive(path=self.rootfs_path)
+            if entropy:
+                entropy_result = self.entropy()
+                if not entropy_result.success:
+                    raise FirecrackerError(entropy_result.error or "Failed to configure entropy")
+            if network_interfaces is not None:
+                for interface in network_interfaces:
+                    network_result = self.network(**interface)
+                    if not network_result.success:
+                        raise FirecrackerError(
+                            network_result.error or "Failed to configure network interface"
+                        )
             self.boot()
             exit_code = self.wait(timeout=timeout)
         except FirecrackerTimeoutError as exc:
@@ -293,11 +314,82 @@ class crackerVM:
     def send_ctrl_alt_del(self) -> None:
         self._runtime.send_ctrl_alt_del()
 
-    def network(self, *, iface_id: str, host_dev_name: str, guest_mac: str) -> None:
-        self._net.network(iface_id=iface_id, host_dev_name=host_dev_name, guest_mac=guest_mac)
+    def network_interfaces(self) -> dict[str, NetworkInterfaceResult]:
+        return dict(self._network_interfaces)
 
-    def entropy(self) -> None:
-        self._net.entropy()
+    def has_entropy(self) -> bool:
+        return self._entropy_enabled
+
+    def network(
+        self,
+        *,
+        iface_id: str,
+        host_dev_name: str,
+        guest_mac: str,
+        strict: bool = True,
+    ) -> NetworkInterfaceResult:
+        status = self.status()
+        if status.state in (VMState.RUNNING, VMState.PAUSED):
+            self._raise_state_error("configure network", status)
+
+        existing = self._network_interfaces.get(iface_id)
+        if existing is not None:
+            if strict:
+                error = FirecrackerStateError(
+                    f"Network interface {iface_id!r} is already configured"
+                )
+                self._last_error = str(error)
+                raise error
+            return existing
+
+        try:
+            self._net.network(
+                iface_id=iface_id,
+                host_dev_name=host_dev_name,
+                guest_mac=guest_mac,
+            )
+            result = NetworkInterfaceResult(
+                iface_id=iface_id,
+                host_dev_name=host_dev_name,
+                guest_mac=guest_mac,
+                success=True,
+                error=None,
+            )
+            self._network_interfaces[iface_id] = result
+            self._last_error = None
+            return result
+        except ValueError:
+            raise
+        except Exception as exc:
+            self._last_error = str(exc)
+            return NetworkInterfaceResult(
+                iface_id=iface_id,
+                host_dev_name=host_dev_name,
+                guest_mac=guest_mac,
+                success=False,
+                error=str(exc),
+            )
+
+    def entropy(self, *, strict: bool = False) -> EntropyResult:
+        status = self.status()
+        if status.state in (VMState.RUNNING, VMState.PAUSED):
+            self._raise_state_error("configure entropy", status)
+
+        if self._entropy_enabled:
+            if strict:
+                error = FirecrackerStateError("Entropy is already configured")
+                self._last_error = str(error)
+                raise error
+            return EntropyResult(enabled=True, success=True, error=None)
+
+        try:
+            self._net.entropy()
+            self._entropy_enabled = True
+            self._last_error = None
+            return EntropyResult(enabled=True, success=True, error=None)
+        except Exception as exc:
+            self._last_error = str(exc)
+            return EntropyResult(enabled=False, success=False, error=str(exc))
 
     def snapshot(
         self,
@@ -351,6 +443,15 @@ class crackerVM:
                 "mem_file_path": str(mem_file),
                 "state": self.state.value,
                 "snapshot_type": "Full",
+                "entropy_enabled": self._entropy_enabled,
+                "network_interfaces": [
+                    {
+                        "iface_id": interface.iface_id,
+                        "host_dev_name": interface.host_dev_name,
+                        "guest_mac": interface.guest_mac,
+                    }
+                    for interface in self._network_interfaces.values()
+                ],
             }
             self._write_json_atomic(manifest_file, manifest)
             self._last_error = None
@@ -416,6 +517,7 @@ class crackerVM:
                 mem_file_path=str(mem_file),
                 resume=resume,
             )
+            self._load_snapshot_metadata(snapshot_file)
             self._state = VMState.RUNNING if resume else VMState.PAUSED
             self._last_error = None
             return RestoreResult(
@@ -443,6 +545,31 @@ class crackerVM:
 
     def _read_text_file(self, path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="replace")
+
+    def _load_snapshot_metadata(self, snapshot_file: Path) -> None:
+        manifest_file = snapshot_file.with_name(f"{snapshot_file.stem}.manifest.json")
+        if not manifest_file.is_file():
+            return
+
+        try:
+            manifest = json.loads(self._read_text_file(manifest_file))
+        except (OSError, json.JSONDecodeError):
+            return
+        self._entropy_enabled = bool(manifest.get("entropy_enabled", False))
+        self._network_interfaces = {}
+        # Restoring TAP/network host state is caller responsibility.
+        for interface in manifest.get("network_interfaces", []):
+            try:
+                result = NetworkInterfaceResult(
+                    iface_id=str(interface["iface_id"]),
+                    host_dev_name=str(interface["host_dev_name"]),
+                    guest_mac=str(interface["guest_mac"]),
+                    success=True,
+                    error=None,
+                )
+            except KeyError:
+                continue
+            self._network_interfaces[result.iface_id] = result
 
     def _write_json_atomic(self, path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

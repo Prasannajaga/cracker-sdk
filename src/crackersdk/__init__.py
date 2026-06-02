@@ -6,7 +6,13 @@ from .errors import (
     FirecrackerTimeoutError,
 )
 from .lifecycle import VMState, VMStatus
-from .result import RestoreResult, SnapshotResult, VMRunResult
+from .result import (
+    EntropyResult,
+    NetworkInterfaceResult,
+    RestoreResult,
+    SnapshotResult,
+    VMRunResult,
+)
 from .vm import crackerVM
 
 __all__ = [
@@ -14,6 +20,8 @@ __all__ = [
     "VMRunResult",
     "SnapshotResult",
     "RestoreResult",
+    "NetworkInterfaceResult",
+    "EntropyResult",
     "VMState",
     "VMStatus",
     "FirecrackerError",

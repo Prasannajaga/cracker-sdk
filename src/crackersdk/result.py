@@ -33,3 +33,19 @@ class RestoreResult:
     state: VMState
     success: bool
     error: str | None
+
+
+@dataclass(frozen=True)
+class NetworkInterfaceResult:
+    iface_id: str
+    host_dev_name: str
+    guest_mac: str
+    success: bool
+    error: str | None
+
+
+@dataclass(frozen=True)
+class EntropyResult:
+    enabled: bool
+    success: bool
+    error: str | None
