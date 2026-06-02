@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .lifecycle import VMState
+
 
 @dataclass(frozen=True)
 class VMRunResult:
@@ -10,4 +12,24 @@ class VMRunResult:
     firecracker_log: str
     stdout: str
     stderr: str
+    error: str | None
+
+
+@dataclass(frozen=True)
+class SnapshotResult:
+    snapshot_path: str
+    mem_file_path: str
+    manifest_path: str | None
+    state: VMState
+    success: bool
+    error: str | None
+
+
+@dataclass(frozen=True)
+class RestoreResult:
+    snapshot_path: str
+    mem_file_path: str
+    resumed: bool
+    state: VMState
+    success: bool
     error: str | None

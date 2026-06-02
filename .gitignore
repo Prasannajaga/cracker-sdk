@@ -48,4 +48,11 @@ examples/rootfs/**/rootfs.ext4
 examples/rootfs/**/rootfs.tar
 examples/rootfs/hello/init
 rootfs.ext4
-examples/
+examples/*
+!examples/snapshot_restore.py
+!examples/rootfs/
+examples/rootfs/*
+!examples/rootfs/longrun/
+examples/rootfs/longrun/*
+!examples/rootfs/longrun/init.c
+!examples/rootfs/longrun/build.sh

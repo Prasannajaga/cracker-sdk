@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from .transport import UnixSocketHTTPClient
 
 
@@ -6,6 +8,8 @@ class SnapshotAPI:
         self._client = client
 
     def create_snapshot(self, *, snapshot_path: str, mem_file_path: str) -> None:
+        snapshot_path = str(Path(snapshot_path).expanduser().resolve())
+        mem_file_path = str(Path(mem_file_path).expanduser().resolve())
         self._client.put(
             "/snapshot/create",
             {
@@ -16,6 +20,8 @@ class SnapshotAPI:
         )
 
     def load_snapshot(self, *, snapshot_path: str, mem_file_path: str, resume: bool = False) -> None:
+        snapshot_path = str(Path(snapshot_path).expanduser().resolve())
+        mem_file_path = str(Path(mem_file_path).expanduser().resolve())
         self._client.put(
             "/snapshot/load",
             {

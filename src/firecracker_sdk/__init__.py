@@ -4,6 +4,8 @@ from crackersdk import (
     FirecrackerProcessError,
     FirecrackerStateError,
     FirecrackerTimeoutError,
+    RestoreResult,
+    SnapshotResult,
     VMRunResult,
     VMState,
     VMStatus,
@@ -13,6 +15,8 @@ from crackersdk import (
 __all__ = [
     "crackerVM",
     "VMRunResult",
+    "SnapshotResult",
+    "RestoreResult",
     "VMState",
     "VMStatus",
     "FirecrackerError",

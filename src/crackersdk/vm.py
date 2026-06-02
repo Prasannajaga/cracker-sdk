@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import time
@@ -17,7 +18,7 @@ from .lifecycle import VMState, VMStatus
 from .logger import _LoggerAPI
 from .networking import NetworkingAPI
 from .process import ProcessConfig, ProcessManager
-from .result import VMRunResult
+from .result import RestoreResult, SnapshotResult, VMRunResult
 from .runtime import RuntimeAPI
 from .snapshot import SnapshotAPI
 from .transport import UnixSocketHTTPClient
@@ -298,15 +299,183 @@ class crackerVM:
     def entropy(self) -> None:
         self._net.entropy()
 
-    def create_snapshot(self, snapshot_path: str, mem_file_path: str) -> None:
-        self._snap.create_snapshot(snapshot_path=snapshot_path, mem_file_path=mem_file_path)
+    def snapshot(
+        self,
+        snapshot_path: str,
+        mem_file_path: str,
+        *,
+        pause: bool = True,
+        overwrite: bool = False,
+    ) -> SnapshotResult:
+        status = self.status()
+        if status.state == VMState.RUNNING and pause:
+            self.pause(strict=True)
+        elif status.state == VMState.EXITED:
+            self._raise_state_error("snapshot", status)
 
-    def load_snapshot(self, snapshot_path: str, mem_file_path: str, resume: bool = False) -> None:
-        self._snap.load_snapshot(
+        return self.create_snapshot(
+            snapshot_path=snapshot_path,
+            mem_file_path=mem_file_path,
+            overwrite=overwrite,
+        )
+
+    def create_snapshot(
+        self,
+        snapshot_path: str,
+        mem_file_path: str,
+        *,
+        overwrite: bool = False,
+    ) -> SnapshotResult:
+        status = self.status()
+        if status.state != VMState.PAUSED:
+            self._raise_state_error("create snapshot", status)
+
+        snapshot_file = Path(snapshot_path).expanduser().resolve()
+        mem_file = Path(mem_file_path).expanduser().resolve()
+        manifest_file = snapshot_file.with_name(f"{snapshot_file.stem}.manifest.json")
+
+        snapshot_file.parent.mkdir(parents=True, exist_ok=True)
+        mem_file.parent.mkdir(parents=True, exist_ok=True)
+        manifest_file.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_not_exists(snapshot_file, overwrite)
+        self._ensure_not_exists(mem_file, overwrite)
+        self._ensure_not_exists(manifest_file, overwrite)
+
+        try:
+            self._snap.create_snapshot(
+                snapshot_path=str(snapshot_file),
+                mem_file_path=str(mem_file),
+            )
+            manifest = {
+                "snapshot_path": str(snapshot_file),
+                "mem_file_path": str(mem_file),
+                "state": self.state.value,
+                "snapshot_type": "Full",
+            }
+            self._write_json_atomic(manifest_file, manifest)
+            self._last_error = None
+            return SnapshotResult(
+                snapshot_path=str(snapshot_file),
+                mem_file_path=str(mem_file),
+                manifest_path=str(manifest_file),
+                state=self.state,
+                success=True,
+                error=None,
+            )
+        except Exception as exc:
+            self._last_error = str(exc)
+            return SnapshotResult(
+                snapshot_path=str(snapshot_file),
+                mem_file_path=str(mem_file),
+                manifest_path=None,
+                state=self.status().state,
+                success=False,
+                error=str(exc),
+            )
+
+    def restore(
+        self,
+        snapshot_path: str,
+        mem_file_path: str,
+        *,
+        resume: bool = True,
+    ) -> RestoreResult:
+        return self.load_snapshot(
             snapshot_path=snapshot_path,
             mem_file_path=mem_file_path,
             resume=resume,
         )
+
+    def load_snapshot(
+        self,
+        snapshot_path: str,
+        mem_file_path: str,
+        *,
+        resume: bool = True,
+    ) -> RestoreResult:
+        status = self.status()
+        if status.process_running:
+            error = FirecrackerStateError("Cannot load snapshot while Firecracker process is running")
+            self._last_error = str(error)
+            raise error
+        if status.state != VMState.EXITED:
+            self._raise_state_error("load snapshot", status)
+
+        snapshot_file = Path(snapshot_path).expanduser().resolve()
+        mem_file = Path(mem_file_path).expanduser().resolve()
+        if not snapshot_file.is_file():
+            raise FileNotFoundError(str(snapshot_file))
+        if not mem_file.is_file():
+            raise FileNotFoundError(str(mem_file))
+
+        try:
+            self.start()
+            self.wait_until_ready()
+            self._snap.load_snapshot(
+                snapshot_path=str(snapshot_file),
+                mem_file_path=str(mem_file),
+                resume=resume,
+            )
+            self._state = VMState.RUNNING if resume else VMState.PAUSED
+            self._last_error = None
+            return RestoreResult(
+                snapshot_path=str(snapshot_file),
+                mem_file_path=str(mem_file),
+                resumed=resume,
+                state=self.state,
+                success=True,
+                error=None,
+            )
+        except Exception as exc:
+            error = str(exc)
+            try:
+                self.stop()
+            finally:
+                self._last_error = error
+            return RestoreResult(
+                snapshot_path=str(snapshot_file),
+                mem_file_path=str(mem_file),
+                resumed=False,
+                state=self.status().state,
+                success=False,
+                error=error,
+            )
+
+    def _read_text_file(self, path: Path) -> str:
+        return path.read_text(encoding="utf-8", errors="replace")
+
+    def _write_json_atomic(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as fp:
+                temp_path = Path(fp.name)
+                json.dump(payload, fp, indent=2, sort_keys=True)
+                fp.write("\n")
+            temp_path.replace(path)
+        except Exception:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            raise
+
+    def _ensure_not_exists(self, path: Path, overwrite: bool) -> None:
+        if not path.exists():
+            return
+        if not overwrite:
+            raise FileExistsError(str(path))
+        if path.is_dir():
+            raise IsADirectoryError(str(path))
+        path.unlink()
 
     def _ensure_log_path(self) -> None:
         if self.log_path is not None:
@@ -367,7 +536,7 @@ class crackerVM:
         if self.log_path is None:
             return ""
         try:
-            return Path(self.log_path).read_text(encoding="utf-8", errors="replace")
+            return self._read_text_file(Path(self.log_path))
         except OSError:
             return ""
 
