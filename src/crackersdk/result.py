@@ -49,3 +49,38 @@ class EntropyResult:
     enabled: bool
     success: bool
     error: str | None
+
+
+@dataclass(frozen=True)
+class VsockResult:
+    guest_cid: int
+    uds_path: str
+    success: bool
+    error: str | None
+
+
+@dataclass(frozen=True)
+class VsockMessageResult:
+    uds_path: str
+    port: int
+    bytes_sent: int
+    bytes_received: int
+    response: bytes
+    success: bool
+    error: str | None
+
+
+@dataclass(frozen=True)
+class BalloonResult:
+    amount_mib: int
+    deflate_on_oom: bool
+    stats_polling_interval_s: int
+    success: bool
+    error: str | None
+
+
+@dataclass(frozen=True)
+class BalloonStatsResult:
+    stats: dict[str, int]
+    success: bool
+    error: str | None

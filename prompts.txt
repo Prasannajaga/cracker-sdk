@@ -1,118 +1,310 @@
-Implement only the boilerplate for a new local Python package named `cracker-sdk`.
+Implement full `vsock` host communication support for `cracker-sdk`.
 
 Goal:
-Create a clean minimal Firecracker SDK package that SparkVM can later depend on. Do not integrate it into SparkVM yet. Only add the package skeleton and basic implementation.
+Go beyond simple Firecracker device configuration. Add:
 
-Package rules:
+1. Firecracker vsock device setup
+2. Host-side vsock client helpers:
 
-* Distribution/package name in `pyproject.toml`: `cracker-sdk`
-* Python import module should be: `crackerSDK`
-* Public usage should support:
+   * `connect`
+   * `send`
+   * `recv`
 
-```python
-from crackerSDK import crackerVM
+Keep all existing public APIs working.
 
-vm = crackerVM(
-    binary="/home/user/.sparkvm/bin/firecracker",
-    socket_path="/tmp/fc.sock",
-    log_path="/tmp/firecracker.log",
-)
+Current SDK already has:
 
-vm.start()
-vm.wait_until_ready()
+* basic VM boot
+* high-level `run()`
+* pause/resume lifecycle support
+* snapshot create/load support
+* network interface and entropy support
+* `VMState` with `RUNNING`, `PAUSED`, `EXITED`
+* `VMStatus`
+* `FirecrackerStateError`
 
-vm.machine(vcpu_count=2, mem_size_mib=2048)
-vm.boot_source(kernel_image_path="vmlinux", boot_args="...")
-vm.root_drive(path="rootfs.ext4")
-vm.drive(drive_id="data", path="execution.ext4")
-vm.network(iface_id="eth0", host_dev_name="tap0", guest_mac="AA:FC:00:00:00:01")
-vm.entropy()
-vm.boot()
+Do not modify SparkVM.
+Keep standard-library only.
 
-exit_code = vm.wait(timeout=60)
-```
-
-Create this structure:
+Target files to add/update:
 
 ```txt
-    pyproject.toml
-    README.md
-    src/
-      crackerSDK/
-        __init__.py
-        vm.py
+src/crackersdk/
+  vsock.py
+  result.py
+  vm.py
+  __init__.py
+
+examples/
+  vsock.py
+
+examples/rootfs/
+  vsock/
+    init.c
+    build.sh
 ```
 
-Implementation requirements:
+## Part 1: Result models
 
-* Keep the SDK implementation mostly inside `vm.py` for now.
-* Organize `vm.py` with clear sections:
+Update `result.py` with:
 
-  1. Errors
-  2. Unix socket HTTP client
-  3. Firecracker process management
-  4. Boot path APIs
-  5. Runtime control APIs
-  6. Networking APIs
-  7. Snapshotting APIs
-  8. High-level `crackerVM` facade
-* Use only Python standard library.
-* Do not import anything from `sparkvm`.
-* Add typed dataclasses where useful, but keep it minimal.
-* Add clean error classes:
+```python
+from dataclasses import dataclass
 
-  * `FirecrackerError`
-  * `FirecrackerAPIError`
-  * `FirecrackerProcessError`
-  * `FirecrackerTimeoutError`
-* Implement low-level Unix socket HTTP request support:
+@dataclass(frozen=True)
+class VsockResult:
+    guest_cid: int
+    uds_path: str
+    success: bool
+    error: str | None
 
-  * `GET`
-  * `PUT`
-  * `PATCH`
-* Implement these boot path APIs:
+@dataclass(frozen=True)
+class VsockMessageResult:
+    uds_path: str
+    port: int
+    bytes_sent: int
+    bytes_received: int
+    response: bytes
+    success: bool
+    error: str | None
+```
 
-  * `GET /machine-config`
-  * `PUT /machine-config`
-  * `PUT /boot-source`
-  * `PUT /drives/{drive_id}`
-  * `PATCH /drives/{drive_id}`
-  * `PUT /actions` with `InstanceStart`
-* Implement these runtime control methods:
+Export all of these from `__init__.py`.
 
-  * `pause()`
-  * `resume()`
-  * `send_ctrl_alt_del()`
-* Implement networking:
+## Part 2: `vsock.py`
 
-  * `network(iface_id, host_dev_name, guest_mac)`
-  * internally call `PUT /network-interfaces/{iface_id}`
-* Implement entropy:
+Create `src/crackersdk/vsock.py`.
 
-  * `entropy()`
-  * internally call `PUT /entropy` with `{}`.
-* Implement snapshotting boilerplate:
+It must contain two classes:
 
-  * `create_snapshot(snapshot_path, mem_file_path)`
-  * `load_snapshot(snapshot_path, mem_file_path, resume=False)`
-* Snapshot methods can be thin wrappers around Firecracker API payloads. Keep them simple.
-* `crackerVM.start()` should start the Firecracker process:
+```python
+class VsockAPI:
+    def __init__(self, client):
+        self._client = client
 
-  * command: `[binary, "--api-sock", socket_path]`
-  * if `namespace_name` is provided, command should be:
-    `[ "ip", "netns", "exec", namespace_name, binary, "--api-sock", socket_path ]`
-* `wait_until_ready()` should wait until the socket file exists and `/machine-config` responds.
-* `boot()` should call `PUT /actions` with `{"action_type": "InstanceStart"}`.
-* `wait(timeout)` should wait for the Firecracker process and return its exit code.
-* `stop()` should terminate the process gracefully, then kill if needed.
-* `__enter__` / `__exit__` should be supported for context-manager usage.
+    def put_vsock(self, *, guest_cid: int, uds_path: str) -> None:
+        ...
+```
+
+`put_vsock()` behavior:
+
+* Validate `guest_cid` is `int` and `> 2`.
+* Validate `uds_path` is non-empty.
+* Resolve `uds_path` to an absolute path.
+* Ensure the parent directory exists.
+* Remove any stale socket file if it already exists.
+* Call:
+
+```python
+PUT /vsock
+{
+  "guest_cid": guest_cid,
+  "uds_path": resolved_uds_path
+}
+```
+
+Also add:
+
+```python
+class VsockClient:
+    def __init__(self, uds_path: str, timeout: float = 5.0):
+        ...
+
+    def connect(self, *, port: int) -> None:
+        ...
+
+    def send(self, data: bytes) -> None:
+        ...
+
+    def recv(self, max_bytes: int = 65536) -> bytes:
+        ...
+
+    def request(self, *, port: int, data: bytes, max_bytes: int = 65536) -> VsockMessageResult:
+        ...
+
+    def close(self) -> None:
+        ...
+
+    def __enter__(self) -> "VsockClient":
+        ...
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        ...
+```
+
+Implementation notes:
+
+* Use Python standard-library `socket`.
+* Connect to Firecracker’s host-side Unix socket at `uds_path`.
+* Use `socket.AF_UNIX` and `socket.SOCK_STREAM`.
+* On `connect(port=...)`, connect to the UDS.
+* Then send the Firecracker host-side vsock connection request header for the guest port.
+* Implement the header format in the simplest compatible way for Firecracker host-initiated vsock connections.
+* Keep the protocol handling isolated and clearly documented in comments.
+* Raise clear exceptions on timeout and socket errors.
+* `request()` should:
+
+  * connect
+  * send bytes
+  * receive a response
+  * close
+  * return `VsockMessageResult`
 
 Important:
 
-* This is only the SDK boilerplate.
-* Do not modify existing SparkVM runtime logic.
-* Do not move existing files yet.
-* Do not add large abstractions.
-* Keep the code small, readable, and easy to extend later.
-* Add a short README showing the same usage example above.
-* Ensure `python -m compileall packages/cracker-sdk/src` passes.
+* `PUT /vsock` only creates the device.
+* The guest must run a vsock listener on the target port.
+* Document this clearly in comments and examples.
+
+## Part 3: Update `crackerVM`
+
+Update `vm.py`.
+
+Instantiate:
+
+```python
+self._vsock_api = VsockAPI(self._client)
+```
+
+Track:
+
+```python
+self._vsock: VsockResult | None = None
+```
+
+Add:
+
+```python
+def vsock_config(self) -> VsockResult | None:
+    ...
+```
+
+Add:
+
+```python
+def vsock(
+    self,
+    *,
+    guest_cid: int,
+    uds_path: str,
+    strict: bool = True,
+) -> VsockResult:
+    ...
+```
+
+Rules:
+
+* Only before boot.
+* If state is `RUNNING` or `PAUSED`, raise `FirecrackerStateError`.
+* If already configured:
+
+  * `strict=True` → raise `FirecrackerStateError`
+  * `strict=False` → return existing config
+* Call `VsockAPI.put_vsock`.
+* Store and return `VsockResult`.
+
+Update `run()` optional args:
+
+```python
+vsock: dict[str, object] | None = None
+```
+
+Before boot:
+
+* If `vsock` is provided, call `self.vsock(...)`
+
+## Part 4: Examples
+
+Add `examples/vsock.py`.
+
+It should:
+
+* Use the vsock rootfs.
+* Configure:
+
+```python
+vm.vsock(
+    guest_cid=3,
+    uds_path="/tmp/cracker-sdk-vsock-demo/vm.vsock",
+)
+```
+
+* Boot the VM.
+* Use:
+
+```python
+VsockClient(...).request(
+    port=5000,
+    data=b"ping",
+)
+```
+
+* Print the response.
+* Stop the VM.
+* Comment that this requires a guest listener on vsock port `5000`.
+
+## Part 5: Vsock rootfs
+
+Add:
+
+```txt
+examples/rootfs/vsock/
+  init.c
+  build.sh
+```
+
+`init.c`:
+
+* Static C program.
+* Write `vsock guest started\n` to `/dev/console`.
+* Create an `AF_VSOCK`, `SOCK_STREAM` socket.
+* Bind to `VMADDR_CID_ANY`, port `5000`.
+* Listen.
+* Accept connections.
+* Read request bytes.
+* If request is `ping`, write `pong from guest\n`.
+* Continue serving requests in a loop.
+
+`build.sh`:
+
+* Compile static init:
+
+```bash
+gcc -static -Os -s -o init init.c
+```
+
+* Create `rootfs.ext4`.
+* Mount it.
+* Copy `init` to `/init`.
+* Mark it executable.
+* Unmount.
+
+Note:
+
+* If host kernel headers do not expose `linux/vm_sockets.h`, include clear compile-error guidance.
+* Document any required kernel or Firecracker vsock prerequisites.
+
+## Part 6: Snapshot manifest metadata
+
+If snapshot manifest support exists, include:
+
+```json
+{
+  "vsock": {
+    "guest_cid": 3,
+    "uds_path": "/tmp/vm.vsock"
+  }
+}
+```
+
+Do not automatically restore host-side vsock socket paths unless the user explicitly configures them. Add the comment:
+
+```txt
+Restoring host-side vsock socket paths is caller responsibility.
+``` 
+
+Expected result:
+
+* SDK supports configuring Firecracker vsock devices.
+* SDK supports host-side vsock request/response helpers.
+* Examples demonstrate the feature clearly.

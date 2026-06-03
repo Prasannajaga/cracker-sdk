@@ -277,7 +277,6 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
-
   /drives/{drive_id}:
     put:
       summary: Creates or updates a drive. Pre-boot only.

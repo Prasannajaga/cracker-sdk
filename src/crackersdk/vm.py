@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .balloon import BalloonAPI
 from .boot import BootAPI
 from .errors import (
     FirecrackerError,
@@ -19,15 +20,19 @@ from .logger import _LoggerAPI
 from .networking import NetworkingAPI
 from .process import ProcessConfig, ProcessManager
 from .result import (
+    BalloonResult,
+    BalloonStatsResult,
     EntropyResult,
     NetworkInterfaceResult,
     RestoreResult,
     SnapshotResult,
     VMRunResult,
+    VsockResult,
 )
 from .runtime import RuntimeAPI
 from .snapshot import SnapshotAPI
 from .transport import UnixSocketHTTPClient
+from .vsock import VsockAPI
 
 
 DEFAULT_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
@@ -73,11 +78,15 @@ class crackerVM:
         self._runtime = RuntimeAPI(self._client)
         self._net = NetworkingAPI(self._client)
         self._snap = SnapshotAPI(self._client)
+        self._vsock_api = VsockAPI(self._client)
+        self._balloon_api = BalloonAPI(self._client)
         self._logger = _LoggerAPI(self._client)
         self._state = VMState.EXITED
         self._last_error: str | None = None
         self._network_interfaces: dict[str, NetworkInterfaceResult] = {}
         self._entropy_enabled = False
+        self._vsock: VsockResult | None = None
+        self._balloon: BalloonResult | None = None
 
     def __enter__(self) -> crackerVM:
         self.start()
@@ -94,6 +103,7 @@ class crackerVM:
 
     def start(self) -> None:
         try:
+            self._prepare_log_file()
             self._proc.start()
             self._last_error = None
         except Exception as exc:
@@ -226,6 +236,7 @@ class crackerVM:
         timeout: float = 30.0,
         entropy: bool = False,
         network_interfaces: list[dict[str, str]] | None = None,
+        vsock: dict[str, object] | None = None,
     ) -> VMRunResult:
         error: str | None = None
         exit_code: int | None = None
@@ -260,6 +271,10 @@ class crackerVM:
                         raise FirecrackerError(
                             network_result.error or "Failed to configure network interface"
                         )
+            if vsock is not None:
+                vsock_result = self.vsock(**vsock)
+                if not vsock_result.success:
+                    raise FirecrackerError(vsock_result.error or "Failed to configure vsock")
             self.boot()
             exit_code = self.wait(timeout=timeout)
         except FirecrackerTimeoutError as exc:
@@ -319,6 +334,28 @@ class crackerVM:
 
     def has_entropy(self) -> bool:
         return self._entropy_enabled
+
+    def vsock_config(self) -> VsockResult | None:
+        return self._vsock
+
+    def balloon_config(self) -> BalloonResult | None:
+        if self._balloon is None:
+            return None
+
+        status = self.status()
+        if not status.process_running:
+            return self._balloon
+
+        try:
+            payload = self._balloon_api.get_balloon()
+        except Exception:
+            return self._balloon
+        if payload is None:
+            return self._balloon
+
+        result = self._balloon_from_payload(payload, error=None)
+        self._balloon = result
+        return result
 
     def network(
         self,
@@ -391,6 +428,162 @@ class crackerVM:
             self._last_error = str(exc)
             return EntropyResult(enabled=False, success=False, error=str(exc))
 
+    def vsock(
+        self,
+        *,
+        guest_cid: int,
+        uds_path: str,
+        strict: bool = True,
+    ) -> VsockResult:
+        status = self.status()
+        if status.state in (VMState.RUNNING, VMState.PAUSED):
+            self._raise_state_error("configure vsock", status)
+
+        if self._vsock is not None:
+            if strict:
+                error = FirecrackerStateError("Vsock is already configured")
+                self._last_error = str(error)
+                raise error
+            return self._vsock
+
+        try:
+            self._vsock_api.put_vsock(guest_cid=guest_cid, uds_path=uds_path)
+            resolved_path = str(Path(uds_path).expanduser().resolve())
+            result = VsockResult(
+                guest_cid=guest_cid,
+                uds_path=resolved_path,
+                success=True,
+                error=None,
+            )
+            self._vsock = result
+            self._last_error = None
+            return result
+        except ValueError:
+            raise
+        except Exception as exc:
+            self._last_error = str(exc)
+            return VsockResult(
+                guest_cid=guest_cid,
+                uds_path=str(Path(uds_path).expanduser().resolve()),
+                success=False,
+                error=str(exc),
+            )
+
+    def balloon(
+        self,
+        *,
+        amount_mib: int,
+        deflate_on_oom: bool,
+        stats_polling_interval_s: int = 0,
+        strict: bool = True,
+    ) -> BalloonResult:
+        status = self.status()
+        if status.state in (VMState.RUNNING, VMState.PAUSED):
+            self._raise_state_error("configure balloon", status)
+
+        if self._balloon is not None:
+            if strict:
+                error = FirecrackerStateError("Balloon is already configured")
+                self._last_error = str(error)
+                raise error
+            return self._balloon
+
+        try:
+            self._balloon_api.put_balloon(
+                amount_mib=amount_mib,
+                deflate_on_oom=deflate_on_oom,
+                stats_polling_interval_s=stats_polling_interval_s,
+            )
+            result = BalloonResult(
+                amount_mib=amount_mib,
+                deflate_on_oom=bool(deflate_on_oom),
+                stats_polling_interval_s=stats_polling_interval_s,
+                success=True,
+                error=None,
+            )
+            self._balloon = result
+            self._last_error = None
+            return result
+        except ValueError:
+            raise
+        except Exception as exc:
+            self._last_error = str(exc)
+            return BalloonResult(
+                amount_mib=amount_mib,
+                deflate_on_oom=bool(deflate_on_oom),
+                stats_polling_interval_s=stats_polling_interval_s,
+                success=False,
+                error=str(exc),
+            )
+
+    def update_balloon(
+        self,
+        *,
+        amount_mib: int,
+        stats_polling_interval_s: int | None = None,
+    ) -> BalloonResult:
+        status = self.status()
+        if status.state not in (VMState.RUNNING, VMState.PAUSED):
+            self._raise_state_error("update balloon", status)
+        if self._balloon is None:
+            error = FirecrackerStateError("Balloon is not configured for this VM")
+            self._last_error = str(error)
+            raise error
+
+        try:
+            self._balloon_api.patch_balloon(
+                amount_mib=amount_mib,
+                stats_polling_interval_s=stats_polling_interval_s,
+            )
+            interval = (
+                self._balloon.stats_polling_interval_s
+                if stats_polling_interval_s is None
+                else stats_polling_interval_s
+            )
+            result = BalloonResult(
+                amount_mib=amount_mib,
+                deflate_on_oom=self._balloon.deflate_on_oom,
+                stats_polling_interval_s=interval,
+                success=True,
+                error=None,
+            )
+            self._balloon = result
+            self._last_error = None
+            return result
+        except ValueError:
+            raise
+        except Exception as exc:
+            self._last_error = str(exc)
+            return BalloonResult(
+                amount_mib=amount_mib,
+                deflate_on_oom=self._balloon.deflate_on_oom,
+                stats_polling_interval_s=self._balloon.stats_polling_interval_s,
+                success=False,
+                error=str(exc),
+            )
+
+    def balloon_stats(self) -> BalloonStatsResult:
+        status = self.status()
+        if status.state not in (VMState.RUNNING, VMState.PAUSED):
+            self._raise_state_error("read balloon stats", status)
+        if self._balloon is None:
+            error = FirecrackerStateError("Balloon is not configured for this VM")
+            self._last_error = str(error)
+            raise error
+
+        try:
+            payload = self._balloon_api.get_statistics() or {}
+            stats = {
+                key: int(value)
+                for key, value in payload.items()
+                if isinstance(value, (int, float))
+            }
+            self._last_error = None
+            return BalloonStatsResult(stats=stats, success=True, error=None)
+        except Exception as exc:
+            self._last_error = str(exc)
+            return BalloonStatsResult(stats={}, success=False, error=str(exc))
+
     def snapshot(
         self,
         snapshot_path: str,
@@ -452,6 +645,23 @@ class crackerVM:
                     }
                     for interface in self._network_interfaces.values()
                 ],
+                "vsock": (
+                    {
+                        "guest_cid": self._vsock.guest_cid,
+                        "uds_path": self._vsock.uds_path,
+                    }
+                    if self._vsock is not None
+                    else None
+                ),
+                "balloon": (
+                    {
+                        "amount_mib": self._balloon.amount_mib,
+                        "deflate_on_oom": self._balloon.deflate_on_oom,
+                        "stats_polling_interval_s": self._balloon.stats_polling_interval_s,
+                    }
+                    if self._balloon is not None
+                    else None
+                ),
             }
             self._write_json_atomic(manifest_file, manifest)
             self._last_error = None
@@ -512,6 +722,8 @@ class crackerVM:
         try:
             self.start()
             self.wait_until_ready()
+            if self.log_path is not None:
+                self.configure_logger(log_path=str(Path(self.log_path).resolve()))
             self._snap.load_snapshot(
                 snapshot_path=str(snapshot_file),
                 mem_file_path=str(mem_file),
@@ -570,6 +782,27 @@ class crackerVM:
             except KeyError:
                 continue
             self._network_interfaces[result.iface_id] = result
+        # Restoring host-side vsock socket paths is caller responsibility.
+        balloon = manifest.get("balloon")
+        if isinstance(balloon, dict):
+            try:
+                self._balloon = self._balloon_from_payload(balloon, error=None)
+            except (TypeError, ValueError):
+                self._balloon = None
+
+    def _balloon_from_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        error: str | None,
+    ) -> BalloonResult:
+        return BalloonResult(
+            amount_mib=int(payload["amount_mib"]),
+            deflate_on_oom=bool(payload["deflate_on_oom"]),
+            stats_polling_interval_s=int(payload.get("stats_polling_interval_s", 0)),
+            success=error is None,
+            error=error,
+        )
 
     def _write_json_atomic(self, path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

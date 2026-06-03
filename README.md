@@ -1,41 +1,65 @@
 # cracker-sdk
 
-Minimal local Firecracker SDK boilerplate package.
+`cracker-sdk` is a small Python wrapper around the Firecracker runtime API that helps you run microVMs efficiently from Python.
 
-Create a minimal bootable root filesystem:
+You can use this SDK in two ways: simple mode and advanced control mode.
 
-```bash
-./bin.sh rootfs.ext4
-```
-
-Use kernel args that point PID 1 at the generated `/init`:
-
-```text
-console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init
-```
+## Simple Implementation
 
 ```python
-from crackerSDK import crackerVM
+from crackersdk import crackerVM
+
+BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
 
 vm = crackerVM(
-    binary="/home/user/.sparkvm/bin/firecracker",
-    socket_path="/tmp/fc.sock",
-    log_path="/tmp/firecracker.log",
+    binary="/home/user/.local/bin/firecracker",
+    socket_path="/tmp/cracker-sdk.sock",
+    log_path="/tmp/cracker-sdk.log",
+    kernel_path="/home/user/images/vmlinux",
+    rootfs_path="examples/rootfs/hello/rootfs.ext4",
+    boot_args=BOOT_ARGS,
 )
 
-vm.start()
-vm.wait_until_ready()
+result = vm.run(vcpu_count=1, mem_size_mib=256, timeout=30)
 
-vm.machine(vcpu_count=2, mem_size_mib=2048)
-vm.boot_source(
-    kernel_image_path="vmlinux",
-    boot_args="console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init",
+print("exit_code:", result.exit_code)
+print("timed_out:", result.timed_out)
+print("error:", result.error)
+print(result.stdout)
+```
+
+## Advanced control 
+
+Use the explicit lifecycle methods when you need full control over the boot
+sequence or want to configure devices step by step.
+
+```python
+from crackersdk import crackerVM
+
+BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
+
+vm = crackerVM(
+    binary="/home/user/.local/bin/firecracker",
+    socket_path="/tmp/cracker-sdk-low-level.sock",
+    log_path="/tmp/cracker-sdk-low-level.log",
 )
-vm.root_drive(path="rootfs.ext4")
-vm.drive(drive_id="data", path="execution.ext4")
-vm.network(iface_id="eth0", host_dev_name="tap0", guest_mac="AA:FC:00:00:00:01")
-vm.entropy()
-vm.boot()
 
-exit_code = vm.wait(timeout=60)
+try:
+    vm.start()
+    vm.wait_until_ready()
+    vm.configure_logger("/tmp/cracker-sdk-low-level.log")
+
+    vm.machine(vcpu_count=2, mem_size_mib=512)
+    vm.boot_source(
+        kernel_image_path="/home/user/images/vmlinux",
+        boot_args=BOOT_ARGS,
+    )
+    vm.root_drive(path="examples/rootfs/hello/rootfs.ext4")
+    vm.entropy()
+
+    vm.boot()
+    exit_code = vm.wait(timeout=30)
+    print("exit_code:", exit_code)
+finally:
+    vm.stop()
 ```
