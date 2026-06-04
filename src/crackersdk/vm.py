@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
+from .balloon_policy import BalloonMemoryOptimizer, BalloonPolicy
 from .balloon import BalloonAPI
 from .boot import BootAPI
 from .errors import (
@@ -23,6 +26,7 @@ from .result import (
     BalloonResult,
     BalloonStatsResult,
     EntropyResult,
+    MemoryOptimizerStatus,
     NetworkInterfaceResult,
     RestoreResult,
     SnapshotResult,
@@ -39,6 +43,17 @@ DEFAULT_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw ini
 
 
 class crackerVM:
+    @staticmethod
+    def checkIfExist() -> dict[str, bool]:
+        checks = {
+            "firecracker": shutil.which("firecracker") is not None,
+            "jailer": shutil.which("jailer") is not None,
+            "KVM": os.path.exists("/dev/kvm"),
+        }
+        for name, exists in checks.items():
+            print(f"{name}: {'OK' if exists else 'missing'}")
+        return checks
+
     def __init__(
         self,
         *,
@@ -51,6 +66,10 @@ class crackerVM:
         rootfs_path: str | None = None,
         boot_args: str = DEFAULT_BOOT_ARGS,
         api_timeout: float = 2.0,
+        optimize_memory: bool = False,
+        memory_policy: BalloonPolicy | None = None,
+        initial_balloon_mib: int | None = None,
+        memory_optimizer_interval_seconds: float = 5.0,
     ):
         self.binary = binary
         self.process_socket_path = socket_path
@@ -68,6 +87,12 @@ class crackerVM:
         self.kernel_path = kernel_path
         self.rootfs_path = rootfs_path
         self.boot_args = boot_args
+        self.optimize_memory = bool(optimize_memory)
+        self.memory_policy = memory_policy
+        self.initial_balloon_mib = initial_balloon_mib
+        self.memory_optimizer_interval_seconds = float(memory_optimizer_interval_seconds)
+        if self.memory_optimizer_interval_seconds <= 0:
+            raise ValueError("memory_optimizer_interval_seconds must be > 0")
 
         self._client = UnixSocketHTTPClient(socket_path=self.api_socket_path, timeout=api_timeout)
         self._proc = ProcessManager(
@@ -92,6 +117,10 @@ class crackerVM:
         self._entropy_enabled = False
         self._vsock: VsockResult | None = None
         self._balloon: BalloonResult | None = None
+        self._machine_config: dict[str, Any] | None = None
+        self._memory_optimizer: BalloonMemoryOptimizer | None = None
+        self._memory_optimizer_lock = threading.RLock()
+        self._memory_optimizer_last_error: str | None = None
 
     def __enter__(self) -> crackerVM:
         self.start()
@@ -143,6 +172,7 @@ class crackerVM:
     def wait(self, timeout: float | None = None) -> int:
         try:
             exit_code = self._proc.wait(timeout=timeout)
+            self._stop_memory_optimizer()
             self._state = VMState.EXITED
             self._last_error = None
             return exit_code
@@ -152,6 +182,7 @@ class crackerVM:
 
     def stop(self, timeout: float = 5.0) -> None:
         try:
+            self._stop_memory_optimizer()
             self._proc.stop(timeout=timeout)
             self._state = VMState.EXITED
             self._last_error = None
@@ -195,6 +226,11 @@ class crackerVM:
 
     def machine(self, *, vcpu_count: int, mem_size_mib: int, smt: bool | None = None) -> None:
         self._boot.machine(vcpu_count=vcpu_count, mem_size_mib=mem_size_mib, smt=smt)
+        self._machine_config = {
+            "vcpu_count": vcpu_count,
+            "mem_size_mib": mem_size_mib,
+            "smt": smt,
+        }
 
     def machine_config(self) -> dict[str, Any] | None:
         return self._boot.get_machine_config()
@@ -223,9 +259,11 @@ class crackerVM:
 
     def boot(self) -> None:
         try:
+            self._configure_memory_optimizer_before_boot()
             self._boot.boot()
             self._state = VMState.RUNNING
             self._last_error = None
+            self._start_memory_optimizer_if_enabled()
         except Exception as exc:
             self._last_error = str(exc)
             raise
@@ -326,6 +364,7 @@ class crackerVM:
             self._runtime.resume()
             self._state = VMState.RUNNING
             self._last_error = None
+            self._start_memory_optimizer_if_enabled()
             return self.status()
         except Exception as exc:
             self._last_error = str(exc)
@@ -589,6 +628,27 @@ class crackerVM:
             self._last_error = str(exc)
             return BalloonStatsResult(stats={}, success=False, error=str(exc))
 
+    def memory_optimizer_status(self) -> MemoryOptimizerStatus:
+        if not self.optimize_memory:
+            return MemoryOptimizerStatus(
+                enabled=False,
+                running=False,
+                interval_seconds=self.memory_optimizer_interval_seconds,
+                last_result=None,
+                last_error=None,
+            )
+
+        with self._memory_optimizer_lock:
+            if self._memory_optimizer is None:
+                return MemoryOptimizerStatus(
+                    enabled=True,
+                    running=False,
+                    interval_seconds=self.memory_optimizer_interval_seconds,
+                    last_result=None,
+                    last_error=self._memory_optimizer_last_error,
+                )
+            return self._memory_optimizer.status()
+
     def snapshot(
         self,
         snapshot_path: str,
@@ -641,6 +701,7 @@ class crackerVM:
                 "mem_file_path": str(mem_file),
                 "state": self.state.value,
                 "snapshot_type": "Full",
+                "machine_config": self._machine_config,
                 "entropy_enabled": self._entropy_enabled,
                 "network_interfaces": [
                     {
@@ -737,6 +798,8 @@ class crackerVM:
             self._load_snapshot_metadata(snapshot_file)
             self._state = VMState.RUNNING if resume else VMState.PAUSED
             self._last_error = None
+            if resume:
+                self._start_memory_optimizer_if_enabled()
             return RestoreResult(
                 snapshot_path=str(snapshot_file),
                 mem_file_path=str(mem_file),
@@ -763,6 +826,89 @@ class crackerVM:
     def _read_text_file(self, path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="replace")
 
+    def _configure_memory_optimizer_before_boot(self) -> None:
+        if not self.optimize_memory:
+            return
+        if self._balloon is not None:
+            return
+        if self._machine_config is None:
+            self._memory_optimizer_last_error = (
+                "optimize_memory=True requires machine() before boot()"
+            )
+            raise FirecrackerError(self._memory_optimizer_last_error)
+
+        policy = self._memory_policy_for_machine()
+        initial_amount = self._initial_balloon_amount(policy)
+        result = self.balloon(
+            amount_mib=initial_amount,
+            deflate_on_oom=True,
+            stats_polling_interval_s=1,
+            strict=False,
+        )
+        if not result.success:
+            self._memory_optimizer_last_error = (
+                result.error or "Failed to configure memory optimizer balloon"
+            )
+
+    def _memory_policy_for_machine(self) -> BalloonPolicy:
+        if self._machine_config is None:
+            raise FirecrackerError("machine() must be called before configuring memory optimizer")
+
+        mem_size_mib = int(self._machine_config["mem_size_mib"])
+        max_balloon_mib = max(0, mem_size_mib - 128)
+        if self.memory_policy is None:
+            min_balloon_mib = 0 if max_balloon_mib == 0 else min(64, max_balloon_mib)
+            return BalloonPolicy(
+                min_balloon_mib=min_balloon_mib,
+                max_balloon_mib=max_balloon_mib,
+                step_mib=128,
+                low_available_mib=2048,
+                high_available_mib=8192,
+                cooldown_seconds=5.0,
+            )
+
+        return BalloonPolicy(
+            min_balloon_mib=min(self.memory_policy.min_balloon_mib, max_balloon_mib),
+            max_balloon_mib=min(self.memory_policy.max_balloon_mib, max_balloon_mib),
+            step_mib=self.memory_policy.step_mib,
+            low_available_mib=self.memory_policy.low_available_mib,
+            high_available_mib=self.memory_policy.high_available_mib,
+            cooldown_seconds=self.memory_policy.cooldown_seconds,
+        )
+
+    def _initial_balloon_amount(self, policy: BalloonPolicy) -> int:
+        if self.initial_balloon_mib is None:
+            return policy.min_balloon_mib
+        return max(0, min(int(self.initial_balloon_mib), policy.max_balloon_mib))
+
+    def _start_memory_optimizer_if_enabled(self) -> None:
+        if not self.optimize_memory:
+            return
+        with self._memory_optimizer_lock:
+            if self._balloon is None:
+                self._memory_optimizer_last_error = (
+                    "Memory optimizer requires a configured balloon device"
+                )
+                return
+            if self._memory_optimizer is None:
+                try:
+                    policy = self._memory_policy_for_machine()
+                except Exception as exc:
+                    self._memory_optimizer_last_error = str(exc)
+                    return
+                self._memory_optimizer = BalloonMemoryOptimizer(
+                    self,
+                    policy,
+                    interval_seconds=self.memory_optimizer_interval_seconds,
+                )
+            self._memory_optimizer.start()
+
+    def _stop_memory_optimizer(self) -> None:
+        with self._memory_optimizer_lock:
+            optimizer = self._memory_optimizer
+        if optimizer is not None:
+            optimizer.stop()
+
     def _load_snapshot_metadata(self, snapshot_file: Path) -> None:
         manifest_file = snapshot_file.with_name(f"{snapshot_file.stem}.manifest.json")
         if not manifest_file.is_file():
@@ -773,6 +919,9 @@ class crackerVM:
         except (OSError, json.JSONDecodeError):
             return
         self._entropy_enabled = bool(manifest.get("entropy_enabled", False))
+        machine_config = manifest.get("machine_config")
+        if isinstance(machine_config, dict):
+            self._machine_config = dict(machine_config)
         self._network_interfaces = {}
         # Restoring TAP/network host state is caller responsibility.
         for interface in manifest.get("network_interfaces", []):

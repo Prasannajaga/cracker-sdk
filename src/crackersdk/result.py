@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .lifecycle import VMState
+
+if TYPE_CHECKING:
+    from .balloon_policy import BalloonPolicyResult
 
 
 @dataclass(frozen=True)
@@ -84,3 +88,12 @@ class BalloonStatsResult:
     stats: dict[str, int]
     success: bool
     error: str | None
+
+
+@dataclass(frozen=True)
+class MemoryOptimizerStatus:
+    enabled: bool
+    running: bool
+    interval_seconds: float
+    last_result: BalloonPolicyResult | None
+    last_error: str | None
