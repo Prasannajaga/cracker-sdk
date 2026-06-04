@@ -45,8 +45,10 @@ def main() -> None:
         boot_vm(source)
         time.sleep(0.5)
         print("source:", source.status())
+        
+        # pauseVM 
+        source.pause(strict=True)
 
-        print("paused:", source.pause(strict=True))
         snapshot = source.create_snapshot(
             snapshot_path=str(SNAPSHOT_PATH),
             mem_file_path=str(MEM_FILE_PATH),
@@ -55,7 +57,7 @@ def main() -> None:
         print("snapshot:", snapshot)
 
         source.stop()
-        restore = restored.load_snapshot(
+        restore = restored.restore(
             snapshot_path=snapshot.snapshot_path,
             mem_file_path=snapshot.mem_file_path,
             resume=True,
@@ -68,4 +70,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+
     main()

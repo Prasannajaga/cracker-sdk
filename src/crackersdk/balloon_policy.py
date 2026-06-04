@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-from crackersdk.vm import crackerVM
-
+from .result import MemoryOptimizerStatus
 from .lifecycle import VMState
+
+if TYPE_CHECKING:
+    from .vm import crackerVM
 
 
 @dataclass(frozen=True)
@@ -83,12 +86,12 @@ def read_host_memory() -> HostMemory:
 
 
 class BalloonAutoscaler:
-    def __init__(self, vm: crackerVM , policy: BalloonPolicy):
+    def __init__(self, vm: crackerVM, policy: BalloonPolicy):
         self.vm = vm
         self.policy = policy
         self._last_change_at: float | None = None
 
-    def tick(self) -> BalloonPolicyResult:
+    def reconcile(self) -> BalloonPolicyResult:
         previous_amount = 0
         host_available = 0
 
@@ -199,11 +202,106 @@ class BalloonAutoscaler:
         host_available_mib: int,
         error: str,
     ) -> BalloonPolicyResult:
-        return BalloonPolicyResult(
-            previous_amount_mib=previous_amount_mib,
-            new_amount_mib=previous_amount_mib,
-            host_available_mib=host_available_mib,
-            action="error",
-            success=False,
-            error=error,
-        )
+            return BalloonPolicyResult(
+                previous_amount_mib=previous_amount_mib,
+                new_amount_mib=previous_amount_mib,
+                host_available_mib=host_available_mib,
+                action="error",
+                success=False,
+                error=error,
+            )
+
+    def tick(self) -> BalloonPolicyResult:
+        return self.reconcile()
+
+
+class BalloonMemoryOptimizer:
+    def __init__(
+        self,
+        vm: crackerVM,
+        policy: BalloonPolicy,
+        *,
+        interval_seconds: float = 5.0,
+        max_failures: int = 3,
+    ):
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be > 0")
+        if max_failures <= 0:
+            raise ValueError("max_failures must be > 0")
+        self.vm = vm
+        self.policy = policy
+        self.interval_seconds = float(interval_seconds)
+        self.max_failures = int(max_failures)
+        self._autoscaler = BalloonAutoscaler(vm, policy)
+        self._stop_event = threading.Event()
+        self._lock = threading.RLock()
+        self._thread: threading.Thread | None = None
+        self._last_result: BalloonPolicyResult | None = None
+        self._last_error: str | None = None
+        self._consecutive_failures = 0
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._run,
+                name="cracker-sdk-memory-optimizer",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        with self._lock:
+            thread = self._thread
+            self._stop_event.set()
+        if thread is not None:
+            thread.join(timeout=float(timeout))
+
+    def status(self) -> MemoryOptimizerStatus:
+        with self._lock:
+            running = self._thread is not None and self._thread.is_alive()
+            return MemoryOptimizerStatus(
+                enabled=True,
+                running=running,
+                interval_seconds=self.interval_seconds,
+                last_result=self._last_result,
+                last_error=self._last_error,
+            )
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                status = self.vm.status()
+                if status.state == VMState.EXITED:
+                    self._stop_event.set()
+                    break
+                if status.state == VMState.PAUSED:
+                    self._stop_event.wait(self.interval_seconds)
+                    continue
+
+                result = self._autoscaler.reconcile()
+                with self._lock:
+                    self._last_result = result
+                    self._last_error = result.error
+                    if result.success:
+                        self._consecutive_failures = 0
+                    else:
+                        self._consecutive_failures += 1
+                        if self._consecutive_failures >= self.max_failures:
+                            self._last_error = (
+                                result.error
+                                or "Memory optimizer stopped after repeated failures"
+                            )
+                            self._stop_event.set()
+                            break
+            except Exception as exc:
+                with self._lock:
+                    self._last_error = str(exc)
+                    self._consecutive_failures += 1
+                    if self._consecutive_failures >= self.max_failures:
+                        self._stop_event.set()
+                        break
+
+            self._stop_event.wait(self.interval_seconds)

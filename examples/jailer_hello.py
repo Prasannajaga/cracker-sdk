@@ -1,6 +1,5 @@
 import sys
-from pathlib import Path
-import time
+from pathlib import Path 
 from crackersdk.vsock import VsockClient 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent

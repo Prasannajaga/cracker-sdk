@@ -98,7 +98,12 @@ class ProcessManager:
             self._log_fp = None
 
         try:
-            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
         except OSError as exc:
             self._close_log()
             raise FirecrackerProcessError(f"Failed to start Firecracker: {exc}") from exc

@@ -29,6 +29,8 @@ from .constant import (
     JAILED_VSOCK_PATH,
 )
 
+JAILER_ROOT_ENV = "JAILER_ROOT"
+
 
 def _resolve_existing_file(path: str) -> Path:
     resolved = Path(path).expanduser().resolve()
@@ -70,6 +72,14 @@ def _sync_shared_asset(source: Path, destination: Path) -> Path:
 
 def _set_owner(path: Path, uid: int, gid: int) -> None:
     os.chown(path, uid, gid)
+
+
+def _effective_chroot_base_dir(config: "JailerConfig") -> Path:
+    configured = config.chroot_base_dir
+    override = os.environ.get(JAILER_ROOT_ENV)
+    if override is not None and override.strip():
+        configured = override
+    return Path(configured).expanduser().resolve()
 
 
 @dataclass(frozen=True)
@@ -426,7 +436,7 @@ class Jailer:
             jail_id=self.config.jail_id,
             uid=self.config.uid,
             gid=self.config.gid,
-            chroot_base_dir=str(Path(self.config.chroot_base_dir).expanduser().resolve()),
+            chroot_base_dir=str(_effective_chroot_base_dir(self.config)),
             socket_path=context.jailed_socket_path,
             extra_args=self.config.extra_args,
         )
@@ -470,7 +480,7 @@ class Jailer:
         source_rootfs = _resolve_existing_file(self.vm.rootfs_path)
 
         root_dir = (
-            Path(self.config.chroot_base_dir).expanduser().resolve()
+            _effective_chroot_base_dir(self.config)
             / "firecracker"
             / self.config.jail_id
             / "root"
