@@ -4,17 +4,26 @@ import os
 import subprocess
 import threading
 from dataclasses import dataclass
+from typing import Protocol
 
 from .errors import FirecrackerProcessError, FirecrackerTimeoutError
+from .launcher import FirecrackerLauncher
+
+
+class Launcher(Protocol):
+    def build_command(self) -> list[str]:
+        ...
 
 
 @dataclass
 class ProcessConfig:
-    binary: str
-    socket_path: str
+    binary: str | None = None
+    socket_path: str | None = None
     log_path: str | None = None
     namespace_name: str | None = None
     mirror_output_to_log: bool = True
+    launcher: Launcher | None = None
+    cleanup_socket_path: str | None = None
 
 
 class ProcessManager:
@@ -32,6 +41,10 @@ class ProcessManager:
         return self._proc
 
     @property
+    def launcher(self) -> Launcher | None:
+        return self._config.launcher
+
+    @property
     def stdout(self) -> str:
         return b"".join(self._stdout_chunks).decode("utf-8", errors="replace")
 
@@ -42,6 +55,15 @@ class ProcessManager:
     def set_log_path(self, log_path: str | None) -> None:
         self._config.log_path = log_path
 
+    def set_socket_path(self, socket_path: str) -> None:
+        self._config.socket_path = socket_path
+
+    def set_cleanup_socket_path(self, socket_path: str | None) -> None:
+        self._config.cleanup_socket_path = socket_path
+
+    def set_launcher(self, launcher: Launcher | None) -> None:
+        self._config.launcher = launcher
+
     def set_mirror_output_to_log(self, enabled: bool) -> None:
         self._config.mirror_output_to_log = enabled
 
@@ -49,24 +71,26 @@ class ProcessManager:
         if self._proc and self._proc.poll() is None:
             raise FirecrackerProcessError("Firecracker process is already running")
 
-        if os.path.exists(self._config.socket_path):
-            os.remove(self._config.socket_path)
+        cleanup_socket_path = self._config.cleanup_socket_path or self._config.socket_path
+        if cleanup_socket_path and os.path.exists(cleanup_socket_path):
+            os.remove(cleanup_socket_path)
 
         self._stdout_chunks = []
         self._stderr_chunks = []
         self._reader_threads = []
 
-        cmd = [self._config.binary, "--api-sock", self._config.socket_path]
-        if self._config.namespace_name:
-            cmd = [
-                "ip",
-                "netns",
-                "exec",
-                self._config.namespace_name,
-                self._config.binary,
-                "--api-sock",
-                self._config.socket_path,
-            ]
+        launcher = self._config.launcher
+        if launcher is None:
+            if self._config.binary is None or self._config.socket_path is None:
+                raise FirecrackerProcessError(
+                    "ProcessConfig requires binary and socket_path when launcher is not provided"
+                )
+            launcher = FirecrackerLauncher(
+                binary=self._config.binary,
+                socket_path=self._config.socket_path,
+                namespace_name=self._config.namespace_name,
+            )
+        cmd = launcher.build_command()
 
         if self._config.log_path and self._config.mirror_output_to_log:
             self._log_fp = open(self._config.log_path, "ab")

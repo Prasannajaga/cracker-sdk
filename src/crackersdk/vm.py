@@ -18,7 +18,7 @@ from .errors import (
 from .lifecycle import VMState, VMStatus
 from .logger import _LoggerAPI
 from .networking import NetworkingAPI
-from .process import ProcessConfig, ProcessManager
+from .process import Launcher, ProcessConfig, ProcessManager
 from .result import (
     BalloonResult,
     BalloonStatsResult,
@@ -53,25 +53,30 @@ class crackerVM:
         api_timeout: float = 2.0,
     ):
         self.binary = binary
+        self.process_socket_path = socket_path
+        self.api_socket_path = socket_path
         self.socket_path = socket_path
         self.workdir = workdir
         if workdir is not None:
             os.makedirs(workdir, exist_ok=True)
             if log_path is None:
                 log_path = os.path.join(workdir, "firecracker.log")
+        self.process_log_path = log_path
+        self.host_log_path = log_path
         self.log_path = log_path
         self.namespace_name = namespace_name
         self.kernel_path = kernel_path
         self.rootfs_path = rootfs_path
         self.boot_args = boot_args
 
-        self._client = UnixSocketHTTPClient(socket_path=socket_path, timeout=api_timeout)
+        self._client = UnixSocketHTTPClient(socket_path=self.api_socket_path, timeout=api_timeout)
         self._proc = ProcessManager(
             ProcessConfig(
                 binary=binary,
-                socket_path=socket_path,
-                log_path=log_path,
+                socket_path=self.process_socket_path,
+                log_path=self.host_log_path,
                 namespace_name=namespace_name,
+                cleanup_socket_path=self.api_socket_path,
             )
         )
         self._boot = BootAPI(self._client)
@@ -121,7 +126,7 @@ class crackerVM:
                 self._last_error = str(error)
                 raise error
 
-            if os.path.exists(self.socket_path):
+            if os.path.exists(self.api_socket_path):
                 try:
                     self._boot.get_machine_config()
                     self._last_error = None
@@ -246,7 +251,7 @@ class crackerVM:
         try:
             self._ensure_log_path()
             self._prepare_log_file()
-            self._proc.set_log_path(self.log_path)
+            self._proc.set_log_path(self.host_log_path)
             self._proc.set_mirror_output_to_log(False)
 
             if self.kernel_path is None:
@@ -256,7 +261,7 @@ class crackerVM:
 
             self.start()
             self.wait_until_ready(timeout=30)
-            self.configure_logger(log_path=str(Path(self.log_path).resolve()))
+            self.configure_logger(log_path=str(Path(self.process_log_path).resolve()))
             self.machine(vcpu_count=vcpu_count, mem_size_mib=mem_size_mib)
             self.boot_source(kernel_image_path=self.kernel_path, boot_args=self.boot_args)
             self.root_drive(path=self.rootfs_path)
@@ -845,14 +850,33 @@ class crackerVM:
             self.workdir = tempfile.mkdtemp(prefix="cracker-sdk-")
         os.makedirs(self.workdir, exist_ok=True)
         self.log_path = os.path.join(self.workdir, "firecracker.log")
+        self.process_log_path = self.log_path
+        self.host_log_path = self.log_path
 
     def _prepare_log_file(self) -> None:
-        if self.log_path is None:
+        if self.host_log_path is None:
             return
 
-        log_path = Path(self.log_path)
+        log_path = Path(self.host_log_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("", encoding="utf-8")
+
+    def _set_socket_paths(self, *, process_socket_path: str, api_socket_path: str) -> None:
+        self.process_socket_path = process_socket_path
+        self.api_socket_path = api_socket_path
+        self.socket_path = api_socket_path
+        self._client.socket_path = api_socket_path
+        self._proc.set_socket_path(process_socket_path)
+        self._proc.set_cleanup_socket_path(api_socket_path)
+
+    def _set_log_paths(self, *, process_log_path: str | None, host_log_path: str | None) -> None:
+        self.process_log_path = process_log_path
+        self.host_log_path = host_log_path
+        self.log_path = host_log_path
+        self._proc.set_log_path(host_log_path)
+
+    def _set_launcher(self, launcher: Launcher | None) -> None:
+        self._proc.set_launcher(launcher)
 
     def _process_state(self) -> tuple[bool, int | None, int | None]:
         process = self._proc.process
@@ -893,10 +917,10 @@ class crackerVM:
         )
 
     def _read_firecracker_log(self) -> str:
-        if self.log_path is None:
+        if self.host_log_path is None:
             return ""
         try:
-            return self._read_text_file(Path(self.log_path))
+            return self._read_text_file(Path(self.host_log_path))
         except OSError:
             return ""
 
@@ -918,3 +942,6 @@ class crackerVM:
             and "T" in line[:32]
             and "[anonymous-instance:" in line
         )
+
+
+CrackerVM = crackerVM

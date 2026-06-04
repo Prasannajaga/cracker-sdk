@@ -10,6 +10,9 @@ from crackersdk import (
     FirecrackerProcessError,
     FirecrackerStateError,
     FirecrackerTimeoutError,
+    Jailer,
+    JailerConfig,
+    JailerRunContext,
     NetworkInterfaceResult,
     RestoreResult,
     SnapshotResult,
@@ -21,12 +24,17 @@ from crackersdk import (
     VsockClient,
     VsockMessageResult,
     VsockResult,
+    CrackerVM,
     crackerVM,
     read_host_memory,
 )
 
 __all__ = [
+    "CrackerVM",
     "crackerVM",
+    "Jailer",
+    "JailerConfig",
+    "JailerRunContext",
     "VMRunResult",
     "SnapshotResult",
     "RestoreResult",

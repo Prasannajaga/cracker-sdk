@@ -12,6 +12,7 @@ from .errors import (
     FirecrackerStateError,
     FirecrackerTimeoutError,
 )
+from .jailer import Jailer, JailerConfig, JailerRunContext
 from .lifecycle import VMState, VMStatus
 from .result import (
     BalloonResult,
@@ -24,11 +25,15 @@ from .result import (
     VsockMessageResult,
     VsockResult,
 )
-from .vm import crackerVM
+from .vm import CrackerVM, crackerVM
 from .vsock import VsockAPI, VsockClient
 
 __all__ = [
+    "CrackerVM",
     "crackerVM",
+    "Jailer",
+    "JailerConfig",
+    "JailerRunContext",
     "VMRunResult",
     "SnapshotResult",
     "RestoreResult",
