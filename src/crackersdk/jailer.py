@@ -4,18 +4,30 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .launcher import JailerLauncher
+from .lifecycle import VMState, VMStatus
 from .process import Launcher
-from .result import VMRunResult
+from .result import (
+    BalloonResult,
+    BalloonStatsResult,
+    EntropyResult,
+    NetworkInterfaceResult,
+    RestoreResult,
+    SnapshotResult,
+    VMRunResult,
+    VsockResult,
+)
 from .vm import crackerVM
-
-
-JAILED_KERNEL_PATH = "/kernel/vmlinux"
-JAILED_ROOTFS_PATH = "/drives/rootfs.ext4"
-JAILED_LOG_PATH = "/logs/firecracker.log"
-JAILED_SOCKET_PATH = "/run/firecracker.socket"
-ASSET_FIRECRACKER_NAME = "firecracker"
+from .constant import (
+    ASSET_FIRECRACKER_NAME,
+    JAILED_KERNEL_PATH,
+    JAILED_LOG_PATH,    
+    JAILED_ROOTFS_PATH,
+    JAILED_SOCKET_PATH,
+    JAILED_VSOCK_PATH,
+)
 
 
 def _resolve_existing_file(path: str) -> Path:
@@ -121,10 +133,293 @@ class Jailer:
         self.vm = vm
         self.config = config
         self._context: JailerRunContext | None = None
+        self._original_state: _VMExecutionState | None = None
+        self._host_vsock_path: str | None = None
 
-    def run(self, *, timeout: float | None = None) -> VMRunResult:
-        context = self._prepare_jail()
-        original_state = self._capture_vm_execution_state()
+    def __enter__(self) -> Jailer:
+        self._ensure_prepared()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.stop()
+        if self.config.cleanup_on_exit:
+            self.cleanup()
+
+    @property
+    def state(self) -> VMState:
+        return self.vm.state
+
+    @property
+    def kernel_path(self) -> str:
+        return self._ensure_prepared().jailed_kernel_path
+
+    @property
+    def rootfs_path(self) -> str:
+        return self._ensure_prepared().jailed_rootfs_path
+
+    @property
+    def log_path(self) -> str:
+        return self._ensure_prepared().jailed_log_path
+
+    @property
+    def socket_path(self) -> str:
+        return self._ensure_prepared().jailed_socket_path
+
+    @property
+    def host_log_path(self) -> str:
+        return self._ensure_prepared().host_log_path
+
+    @property
+    def host_socket_path(self) -> str:
+        return self._ensure_prepared().host_socket_path
+
+    @property
+    def host_vsock_path(self) -> str | None:
+        return self._host_vsock_path
+
+    def start(self) -> None:
+        self._ensure_prepared()
+        return self.vm.start()
+
+    def wait_until_ready(
+        self,
+        timeout: float = 10.0,
+        poll_interval: float = 0.1,
+    ) -> None:
+        return self.vm.wait_until_ready(timeout=timeout, poll_interval=poll_interval)
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.vm.wait(timeout=timeout)
+
+    def stop(self, timeout: float = 5.0) -> None:
+        return self.vm.stop(timeout=timeout)
+
+    def status(self) -> VMStatus:
+        return self.vm.status()
+
+    def is_running(self) -> bool:
+        return self.vm.is_running()
+
+    def is_paused(self) -> bool:
+        return self.vm.is_paused()
+
+    def is_stopped(self) -> bool:
+        return self.vm.is_stopped()
+
+    def run(
+        self,
+        *,
+        vcpu_count: int = 1,
+        mem_size_mib: int = 256,
+        timeout: float = 30.0,
+        entropy: bool = False,
+        network_interfaces: list[dict[str, str]] | None = None,
+        vsock: dict[str, object] | None = None,
+    ) -> VMRunResult:
+        self._ensure_prepared()
+        if vsock is not None:
+            vsock = dict(vsock)
+            uds_path = vsock.get("uds_path")
+            if uds_path is None:
+                vsock["uds_path"] = self._prepare_vsock_path(None)
+            elif isinstance(uds_path, str):
+                vsock["uds_path"] = self._prepare_vsock_path(uds_path)
+        try:
+            return self.vm.run(
+                vcpu_count=vcpu_count,
+                mem_size_mib=mem_size_mib,
+                timeout=timeout,
+                entropy=entropy,
+                network_interfaces=network_interfaces,
+                vsock=vsock,
+            )
+        finally:
+            if self.config.cleanup_on_exit:
+                self.cleanup()
+
+    def machine(
+        self,
+        *,
+        vcpu_count: int,
+        mem_size_mib: int,
+        smt: bool | None = None,
+    ) -> None:
+        return self.vm.machine(vcpu_count=vcpu_count, mem_size_mib=mem_size_mib, smt=smt)
+
+    def machine_config(self) -> dict[str, Any] | None:
+        return self.vm.machine_config()
+
+    def boot_source(self, *, kernel_image_path: str, boot_args: str = "") -> None:
+        return self.vm.boot_source(kernel_image_path=kernel_image_path, boot_args=boot_args)
+
+    def root_drive(self, *, path: str, is_read_only: bool = False) -> None:
+        return self.vm.root_drive(path=path, is_read_only=is_read_only)
+
+    def drive(self, *, drive_id: str, path: str, is_read_only: bool = False) -> None:
+        return self.vm.drive(drive_id=drive_id, path=path, is_read_only=is_read_only)
+
+    def patch_drive(self, *, drive_id: str, path: str | None = None) -> None:
+        return self.vm.patch_drive(drive_id=drive_id, path=path)
+
+    def boot(self) -> None:
+        return self.vm.boot()
+
+    def pause(self, *, strict: bool = False) -> VMStatus:
+        return self.vm.pause(strict=strict)
+
+    def resume(self, *, strict: bool = False) -> VMStatus:
+        return self.vm.resume(strict=strict)
+
+    def send_ctrl_alt_del(self) -> None:
+        return self.vm.send_ctrl_alt_del()
+
+    def network(
+        self,
+        *,
+        iface_id: str,
+        host_dev_name: str,
+        guest_mac: str,
+        strict: bool = True,
+    ) -> NetworkInterfaceResult:
+        return self.vm.network(
+            iface_id=iface_id,
+            host_dev_name=host_dev_name,
+            guest_mac=guest_mac,
+            strict=strict,
+        )
+
+    def network_interfaces(self) -> dict[str, NetworkInterfaceResult]:
+        return self.vm.network_interfaces()
+
+    def entropy(self, *, strict: bool = False) -> EntropyResult:
+        return self.vm.entropy(strict=strict)
+
+    def has_entropy(self) -> bool:
+        return self.vm.has_entropy()
+
+    def vsock(
+        self,
+        *,
+        guest_cid: int,
+        uds_path: str | None = None,
+        strict: bool = True,
+    ) -> VsockResult:
+        uds_path = self._prepare_vsock_path(uds_path)
+        return self.vm.vsock(guest_cid=guest_cid, uds_path=uds_path, strict=strict)
+
+    def vsock_config(self) -> VsockResult | None:
+        return self.vm.vsock_config()
+
+    def balloon(
+        self,
+        *,
+        amount_mib: int,
+        deflate_on_oom: bool,
+        stats_polling_interval_s: int = 0,
+        strict: bool = True,
+    ) -> BalloonResult:
+        return self.vm.balloon(
+            amount_mib=amount_mib,
+            deflate_on_oom=deflate_on_oom,
+            stats_polling_interval_s=stats_polling_interval_s,
+            strict=strict,
+        )
+
+    def balloon_config(self) -> BalloonResult | None:
+        return self.vm.balloon_config()
+
+    def update_balloon(
+        self,
+        *,
+        amount_mib: int,
+        stats_polling_interval_s: int | None = None,
+    ) -> BalloonResult:
+        return self.vm.update_balloon(
+            amount_mib=amount_mib,
+            stats_polling_interval_s=stats_polling_interval_s,
+        )
+
+    def balloon_stats(self) -> BalloonStatsResult:
+        return self.vm.balloon_stats()
+
+    def snapshot(
+        self,
+        snapshot_path: str,
+        mem_file_path: str,
+        *,
+        pause: bool = True,
+        overwrite: bool = False,
+    ) -> SnapshotResult:
+        return self.vm.snapshot(
+            snapshot_path=snapshot_path,
+            mem_file_path=mem_file_path,
+            pause=pause,
+            overwrite=overwrite,
+        )
+
+    def create_snapshot(
+        self,
+        snapshot_path: str,
+        mem_file_path: str,
+        *,
+        overwrite: bool = False,
+    ) -> SnapshotResult:
+        return self.vm.create_snapshot(
+            snapshot_path=snapshot_path,
+            mem_file_path=mem_file_path,
+            overwrite=overwrite,
+        )
+
+    def restore(
+        self,
+        snapshot_path: str,
+        mem_file_path: str,
+        *,
+        resume: bool = True,
+    ) -> RestoreResult:
+        return self.vm.restore(
+            snapshot_path=snapshot_path,
+            mem_file_path=mem_file_path,
+            resume=resume,
+        )
+
+    def load_snapshot(
+        self,
+        snapshot_path: str,
+        mem_file_path: str,
+        *,
+        resume: bool = True,
+    ) -> RestoreResult:
+        return self.vm.load_snapshot(
+            snapshot_path=snapshot_path,
+            mem_file_path=mem_file_path,
+            resume=resume,
+        )
+
+    def configure_logger(self, log_path: str, level: str = "Info") -> None:
+        return self.vm.configure_logger(log_path=log_path, level=level)
+
+    def cleanup(self) -> None:
+        if self._context is None:
+            return
+        shutil.rmtree(Path(self._context.root_dir).parent, ignore_errors=True)
+        if self._original_state is not None:
+            self._restore_vm_execution_state(self._original_state)
+            self._original_state = None
+        self._context = None
+        self._host_vsock_path = None
+
+    def __getattr__(self, name: str):
+        return getattr(self.vm, name)
+
+    def _ensure_prepared(self) -> JailerRunContext:
+        if self._context is None:
+            context = self._prepare_jail()
+            self._original_state = self._capture_vm_execution_state()
+            self._apply_jail_context(context)
+        return self._context
+
+    def _apply_jail_context(self, context: JailerRunContext) -> None:
         launcher = JailerLauncher(
             jailer_binary=str(_resolve_executable(self.config.jailer_binary)),
             exec_file=str(self._shared_firecracker_path(context.root_dir)),
@@ -135,40 +430,31 @@ class Jailer:
             socket_path=context.jailed_socket_path,
             extra_args=self.config.extra_args,
         )
+        self.vm.kernel_path = context.jailed_kernel_path
+        self.vm.rootfs_path = context.jailed_rootfs_path
+        self.vm._set_socket_paths(
+            process_socket_path=context.jailed_socket_path,
+            api_socket_path=context.host_socket_path,
+        )
+        self.vm._set_log_paths(
+            process_log_path=context.jailed_log_path,
+            host_log_path=context.host_log_path,
+        )
+        self.vm._set_launcher(launcher)
 
-        try:
-            self.vm.kernel_path = context.jailed_kernel_path
-            self.vm.rootfs_path = context.jailed_rootfs_path
-            self.vm._set_socket_paths(
-                process_socket_path=context.jailed_socket_path,
-                api_socket_path=context.host_socket_path,
-            )
-            self.vm._set_log_paths(
-                process_log_path=context.jailed_log_path,
-                host_log_path=context.host_log_path,
-            )
-            self.vm._set_launcher(launcher)
-
-            result = self.vm.run() if timeout is None else self.vm.run(timeout=timeout)
-            if result.error is not None or result.timed_out:
-                self.vm.stop()
-            return result
-        except Exception:
-            self.vm.stop()
-            raise
-        finally:
-            self._restore_vm_execution_state(original_state)
-            if self.config.cleanup_on_exit:
-                self.cleanup()
-
-    def cleanup(self) -> None:
-        if self._context is None:
-            return
-        shutil.rmtree(Path(self._context.root_dir).parent, ignore_errors=True)
-        self._context = None
-
-    def __getattr__(self, name: str):
-        return getattr(self.vm, name)
+    def _prepare_vsock_path(self, uds_path: str | None) -> str:
+        context = self._ensure_prepared()
+        jailed_path = uds_path or JAILED_VSOCK_PATH
+        if Path(jailed_path).is_absolute():
+            host_vsock = Path(context.root_dir) / jailed_path.removeprefix("/")
+            host_vsock.parent.mkdir(parents=True, exist_ok=True)
+            _set_owner(host_vsock.parent, self.config.uid, self.config.gid)
+            try:
+                host_vsock.unlink()
+            except FileNotFoundError:
+                pass
+            self._host_vsock_path = str(host_vsock)
+        return jailed_path
 
     def _shared_firecracker_path(self, root_dir: str) -> Path:
         return Path(root_dir).parent.parent / "assets" / ASSET_FIRECRACKER_NAME

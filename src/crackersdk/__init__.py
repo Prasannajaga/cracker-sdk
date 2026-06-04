@@ -13,6 +13,17 @@ from .errors import (
     FirecrackerTimeoutError,
 )
 from .jailer import Jailer, JailerConfig, JailerRunContext
+from .interfaces import (
+    VMBalloon,
+    VMBootConfig,
+    VMLifecycle,
+    VMLogging,
+    VMNetworking,
+    VMRuntime,
+    VMRuntimeControl,
+    VMSnapshot,
+    VMVsock,
+)
 from .lifecycle import VMState, VMStatus
 from .result import (
     BalloonResult,
@@ -34,6 +45,15 @@ __all__ = [
     "Jailer",
     "JailerConfig",
     "JailerRunContext",
+    "VMLifecycle",
+    "VMBootConfig",
+    "VMRuntimeControl",
+    "VMNetworking",
+    "VMVsock",
+    "VMBalloon",
+    "VMSnapshot",
+    "VMLogging",
+    "VMRuntime",
     "VMRunResult",
     "SnapshotResult",
     "RestoreResult",

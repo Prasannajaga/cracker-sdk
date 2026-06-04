@@ -1,9 +1,8 @@
 import re
 
 from .transport import UnixSocketHTTPClient
+from .constant import MAC_ADDRESS_RE
 
-
-MAC_ADDRESS_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 
 
 class NetworkingAPI:
