@@ -7,7 +7,6 @@
 If you are new to this topic, check my blog post:
 [Behind Serverless Functions: Firecracker KVM and Linux](https://medium.com/@prasannajaga9/behind-serverless-functions-firecracker-kvm-and-linux-979aa1862c3f)
 
-
 Before we start implementing, make sure all the required binaries are available in your system using:
 
 ```python
@@ -19,8 +18,7 @@ response = crackerVM.checkIfExist()
     "jailer": "OK",
     "KVM": "OK"
 }
-``` 
-
+```
 
 you can use this SDK in two ways: simple mode and advanced secure control mode.
 
@@ -98,7 +96,9 @@ finally:
 
 ## Features
 
-`Snapshots & Restore` achieve even faster "instant" cold starts by using Snapshots. You can boot a VM, pause it, take a snapshot of its memory and state, and later resume a completely new VM from that exact state.
+`Snapshots & Restore` help when the normal boot path is still too slow for your workload.
+Instead of rebuilding the same guest state every time, you can boot a VM once, let it finish its setup work, pause it, and save both the VM state and memory to disk. Later, a new VM can restore from those files and continue from that saved point.
+The snapshot file stores the device and VM state, while the memory file stores guest RAM. Keep both files together and restore them with the same kernel/rootfs assumptions you used when creating the snapshot  
 
 ```python
 from crackersdk import CrackerVM
@@ -108,6 +108,8 @@ SOURCE_SOCKET = "/tmp/cracker-sdk-source.sock"
 RESTORED_SOCKET = "/tmp/cracker-sdk-restored.sock"
 SNAPSHOT_PATH = "/tmp/cracker-sdk.snapshot"
 MEM_FILE_PATH = "/tmp/cracker-sdk.mem"
+
+CrackerVM.checkIfExist()
 
 # Start and configure source_vm before snapshotting it.
 source_vm = CrackerVM(binary=FC_BINARY, socket_path=SOURCE_SOCKET)
@@ -120,7 +122,7 @@ snapshot = source_vm.create_snapshot(
 )
 source_vm.stop()
 
-# Resume from snapshot instantly 
+# Resume from snapshot instantly
 restored_vm = CrackerVM(binary=FC_BINARY, socket_path=RESTORED_SOCKET)
 restored_vm.restore(
     snapshot_path=snapshot.snapshot_path,
@@ -131,12 +133,17 @@ print("Restored VM Status:", restored_vm.status())
 
 ```
 
-`Dynamic Memory Ballooning` allowing you to dynamically adjust the memory available to the guest VM while it is running.
+`Dynamic Memory Ballooning` lets the host reclaim memory from a guest VM without stopping it.
+Firecracker exposes this through a virtio-balloon device: when the balloon grows, the guest gives memory back to the host; when it shrinks, the guest gets more memory again.
+
+In practice this is handy when you run many microVMs on the same machine. Some guests sit mostly idle while others are busy, and ballooning gives you a way to shift memory around instead of reserving the worst-case amount for every VM. You can control the balloon manually, or use a `BalloonPolicy` so the SDK adjusts it in the background based on host memory pressure.
 
 ```python
 from crackersdk import BalloonPolicy, CrackerVM
 
 BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
+
+CrackerVM.checkIfExist()
 
 policy = BalloonPolicy(
     min_balloon_mib=64,
@@ -162,7 +169,33 @@ vm = CrackerVM(
 
 By setting `optimize_memory=True`, the SDK configures a virtio-balloon device before boot and starts the background memory optimizer when the VM boots.
 
-`Networking`Adding tap devices to give the VM internet/network access
+`Tunneling with Vsock` gives you a simple private channel between the host and the guest.
+It is useful when you want request/response communication without creating a tap device, assigning IPs, or exposing a TCP port. The host talks to a Unix socket, and Firecracker forwards that traffic to a vsock port inside the guest.
+
+This works well for small control APIs, health checks, bootstrap messages, or moving data between the host and a jailed VM. Your guest still needs a listener on the vsock port you choose.
+
+```python
+from crackersdk import VsockClient, crackerVM
+
+VSOCK_PATH = "/tmp/cracker-sdk-vsock.sock"
+
+crackerVM.checkIfExist()
+
+vm = crackerVM(
+    binary="/home/user/.local/bin/firecracker",
+    socket_path="/tmp/cracker-sdk.sock",
+    log_path="/tmp/cracker-sdk.log",
+)
+
+vm.start()
+vm.wait_until_ready()
+print("vsock:", vm.vsock(guest_cid=3, uds_path=VSOCK_PATH))
+
+# Requires a guest listener on vsock port 5000.
+print("response:", VsockClient(VSOCK_PATH).request(port=5000, data=b"ping"))
+```
+
+`Networking` adds tap devices to give the VM internet/network access.
 
 ```python
 
