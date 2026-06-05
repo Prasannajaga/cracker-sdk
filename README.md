@@ -7,7 +7,22 @@
 If you are new to this topic, check my blog post:
 [Behind Serverless Functions: Firecracker KVM and Linux](https://medium.com/@prasannajaga9/behind-serverless-functions-firecracker-kvm-and-linux-979aa1862c3f)
 
-You can use this SDK in two ways: simple mode and advanced secure control mode.
+
+Before we start implementing, make sure all the required binaries are available in your system using:
+
+```python
+response = crackerVM.checkIfExist()
+
+# Expected response
+{
+    "firecracker": "OK" | "MISSING,
+    "jailer": "OK",
+    "KVM": "OK"
+}
+``` 
+
+
+you can use this SDK in two ways: simple mode and advanced secure control mode.
 
 ## QuickStart examples
 
@@ -24,7 +39,7 @@ response = crackerVM.checkIfExist()
     "jailer": "OK",
     "KVM": "OK"
 }
-``` 
+```
 
 ```python
 from crackersdk import crackerVM
