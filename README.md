@@ -2,6 +2,8 @@
 
 `cracker-sdk` is a small Python wrapper around the Firecracker runtime API that helps you run microVMs efficiently from Python.
 
+`NOTE:` This SDK supports Linux environments alone, because Linux is what powers 90% of cloud platforms. You can’t run this on Mac or Windows. This SDK will be used to deploy and manage your VM efficiently with a high-level API in Python.
+
 If you are new to this topic, check my blog post:
 [Behind Serverless Functions: Firecracker KVM and Linux](https://medium.com/@prasannajaga9/behind-serverless-functions-firecracker-kvm-and-linux-979aa1862c3f)
 
@@ -11,10 +13,25 @@ You can use this SDK in two ways: simple mode and advanced secure control mode.
 
 In this example, we use Firecracker directly without the jailer implementation. This demonstrates how quickly you can spin up a microVM using `cracker-sdk`.
 
+Before creating your `CrackerVM` object, make sure all the required binaries are available in your system using:
+
+```python
+response = crackerVM.checkIfExist()
+
+# Expected response
+{
+    "firecracker": "OK",
+    "jailer": "OK",
+    "KVM": "OK"
+}
+``` 
+
 ```python
 from crackersdk import crackerVM
 
 BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
+
+crackerVM.checkIfExist()
 
 vm = crackerVM(
     binary="/home/user/.local/bin/firecracker",
@@ -35,6 +52,8 @@ use the explicit lifecycle methods when you need full control over the boot sequ
 from crackersdk import crackerVM
 
 BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
+
+crackerVM.checkIfExist()
 
 vm = crackerVM(
     binary="/home/user/.local/bin/firecracker",
@@ -64,7 +83,7 @@ finally:
 
 ## Features
 
-1. `Snapshots & Restore` achieve even faster "instant" cold starts by using Snapshots. You can boot a VM, pause it, take a snapshot of its memory and state, and later resume a completely new VM from that exact state.
+`Snapshots & Restore` achieve even faster "instant" cold starts by using Snapshots. You can boot a VM, pause it, take a snapshot of its memory and state, and later resume a completely new VM from that exact state.
 
 ```python
 from crackersdk import CrackerVM
@@ -97,7 +116,7 @@ print("Restored VM Status:", restored_vm.status())
 
 ```
 
-2. `Dynamic Memory Ballooning` allowing you to dynamically adjust the memory available to the guest VM while it is running.
+`Dynamic Memory Ballooning` allowing you to dynamically adjust the memory available to the guest VM while it is running.
 
 ```python
 from crackersdk import BalloonPolicy, CrackerVM
@@ -128,7 +147,7 @@ vm = CrackerVM(
 
 By setting `optimize_memory=True`, the SDK configures a virtio-balloon device before boot and starts the background memory optimizer when the VM boots.
 
-3. `Networking`Adding tap devices to give the VM internet/network access
+`Networking`Adding tap devices to give the VM internet/network access
 
 ```python
 
@@ -149,6 +168,12 @@ If the VM gets compromised, there is a chance it could access host machine data 
 The jailer restricts what the guest can access on the host system, helping protect sensitive files and resources even if something inside the VM is compromised.
 
 ![](assets/jailer.png)
+
+You can optionally set a global jailer root:
+
+```bash
+export JAILER_ROOT=/tmp/cracker-jailer
+```
 
 `JailerConfig.chroot_base_dir` controls where jail directories are created. If `JAILER_ROOT` is set in the process environment, the SDK uses that value instead of `chroot_base_dir`.
 
