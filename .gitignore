@@ -43,20 +43,5 @@ wget-log
 wget-log.1
 NEWREADME.md
 
-examples/*
-!examples/*.py
-!examples/rootfs/
-examples/rootfs/*
-examples/rootfs/**/mnt/
-examples/rootfs/**/rootfs.ext4
-examples/rootfs/**/rootfs.tar
-examples/rootfs/**/init
-!examples/rootfs/longrun/
-examples/rootfs/longrun/*
-!examples/rootfs/longrun/init.c
-!examples/rootfs/longrun/build.sh
-!examples/rootfs/vsock/
-examples/rootfs/vsock/*
-!examples/rootfs/vsock/init.c
-!examples/rootfs/vsock/build.sh
-rootfs.ext4
+# examples/
+*.ext4

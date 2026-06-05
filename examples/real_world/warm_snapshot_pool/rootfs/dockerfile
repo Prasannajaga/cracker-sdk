@@ -1,0 +1,6 @@
+FROM public.ecr.aws/lambda/python:3.12
+
+COPY init /init
+COPY counter.py /counter.py
+
+RUN chmod +x /init

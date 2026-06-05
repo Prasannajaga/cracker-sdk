@@ -1,0 +1,16 @@
+#!/bin/sh
+
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+
+echo "starting python runtime test" > /dev/console
+/var/lang/bin/python3 /app/app.py > /dev/console 2>&1
+echo "python script finished" > /dev/console
+
+sync
+poweroff -f || reboot -f || halt -f
+
+while true; do
+    sleep 3600
+done
