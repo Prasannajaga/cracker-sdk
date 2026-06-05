@@ -13,10 +13,25 @@ You can use this SDK in two ways: simple mode and advanced secure control mode.
 
 In this example, we use Firecracker directly without the jailer implementation. This demonstrates how quickly you can spin up a microVM using `cracker-sdk`.
 
+Before creating your `CrackerVM` object, make sure all the required binaries are available in your system using:
+
+```python
+response = crackerVM.checkIfExist()
+
+# Expected response
+{
+    "firecracker": "OK",
+    "jailer": "OK",
+    "KVM": "OK"
+}
+``` 
+
 ```python
 from crackersdk import crackerVM
 
 BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
+
+crackerVM.checkIfExist()
 
 vm = crackerVM(
     binary="/home/user/.local/bin/firecracker",
@@ -37,6 +52,8 @@ use the explicit lifecycle methods when you need full control over the boot sequ
 from crackersdk import crackerVM
 
 BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
+
+crackerVM.checkIfExist()
 
 vm = crackerVM(
     binary="/home/user/.local/bin/firecracker",
