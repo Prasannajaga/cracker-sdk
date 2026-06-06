@@ -44,4 +44,6 @@ wget-log.1
 NEWREADME.md
 
 # examples/
-*.ext4
+*.ext4 
+firecracker_ed25519
+firecracker_ed25519.pub
