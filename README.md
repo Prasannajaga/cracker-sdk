@@ -20,7 +20,13 @@ response = crackerVM.checkIfExist()
 }
 ```
 
-you can use this SDK in two ways: simple mode and advanced secure control mode.
+you can find more real world usecase here:
+
+- [Exec Sandboxing](examples_usecases/exec_sandboxing/README.md)
+- [Isolated Python Job Runner](examples_usecases/isolated_python_job_runner/README.md)
+- [Memory Governed Workers](examples_usecases/memory_governed_workers/README.md)
+- [SSH Sandbox](examples_usecases/ssh_sandbox/README.md)
+- [Warm Snapshot Pool](examples_usecases/warm_snapshot_pool/README.md)
 
 ## QuickStart examples
 
